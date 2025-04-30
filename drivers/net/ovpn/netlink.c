@@ -423,9 +423,14 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 	ovpn_sock = ovpn_socket_new(sock, peer);
 	/* at this point we unconditionally drop the reference to the socket:
 	 * - in case of error, the socket has to be dropped
-	 * - if case of success, the socket is configured and let
+	 * - if case of success, the socket is configured and we let
 	 *   userspace own the reference, so that the latter can
-	 *   trigger the final close()
+	 *   trigger the final close().
+	 *
+	 * NOTE: at this point ovpn_socket_new() has acquired a reference
+	 * to sock->sk. That's needed especially to avoid race conditions
+	 * during cleanup, where sock may still be alive, but sock->sk may be
+	 * getting released concurrently.
 	 */
 	sockfd_put(sock);
 	if (IS_ERR(ovpn_sock)) {
@@ -501,7 +506,7 @@ int ovpn_nl_peer_set_doit(struct sk_buff *skb, struct genl_info *info)
 	/* when using a TCP socket the remote IP is not expected */
 	rcu_read_lock();
 	sock = rcu_dereference(peer->sock);
-	if (sock && sock->sock->sk->sk_protocol == IPPROTO_TCP &&
+	if (sock && sock->sk->sk_protocol == IPPROTO_TCP &&
 	    (attrs[OVPN_A_PEER_REMOTE_IPV4] ||
 	     attrs[OVPN_A_PEER_REMOTE_IPV6])) {
 		rcu_read_unlock();
@@ -559,14 +564,14 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 		goto err_unlock;
 	}
 
-	if (!net_eq(genl_info_net(info), sock_net(sock->sock->sk))) {
+	if (!net_eq(genl_info_net(info), sock_net(sock->sk))) {
 		id = peernet2id_alloc(genl_info_net(info),
-				      sock_net(sock->sock->sk),
+				      sock_net(sock->sk),
 				      GFP_ATOMIC);
 		if (nla_put_s32(skb, OVPN_A_PEER_SOCKET_NETNSID, id))
 			goto err_unlock;
 	}
-	local_port = inet_sk(sock->sock->sk)->inet_sport;
+	local_port = inet_sk(sock->sk)->inet_sport;
 	rcu_read_unlock();
 
 	if (nla_put_u32(skb, OVPN_A_PEER_ID, peer->id))
@@ -1153,8 +1158,8 @@ int ovpn_nl_peer_del_notify(struct ovpn_peer *peer)
 		ret = -EINVAL;
 		goto err_unlock;
 	}
-	genlmsg_multicast_netns(&ovpn_nl_family, sock_net(sock->sock->sk),
-				msg, 0, OVPN_NLGRP_PEERS, GFP_ATOMIC);
+	genlmsg_multicast_netns(&ovpn_nl_family, sock_net(sock->sk), msg, 0,
+				OVPN_NLGRP_PEERS, GFP_ATOMIC);
 	rcu_read_unlock();
 
 	return 0;
@@ -1218,8 +1223,8 @@ int ovpn_nl_key_swap_notify(struct ovpn_peer *peer, u8 key_id)
 		ret = -EINVAL;
 		goto err_unlock;
 	}
-	genlmsg_multicast_netns(&ovpn_nl_family, sock_net(sock->sock->sk),
-				msg, 0, OVPN_NLGRP_PEERS, GFP_ATOMIC);
+	genlmsg_multicast_netns(&ovpn_nl_family, sock_net(sock->sk), msg, 0,
+				OVPN_NLGRP_PEERS, GFP_ATOMIC);
 	rcu_read_unlock();
 
 	return 0;
