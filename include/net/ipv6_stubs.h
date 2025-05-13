@@ -55,6 +55,7 @@ struct ipv6_stub {
 			       struct nl_info *info);
 
 	void (*udpv6_encap_enable)(void);
+	void (*udpv6_encap_disable)(void);
 	void (*ndisc_send_na)(struct net_device *dev, const struct in6_addr *daddr,
 			      const struct in6_addr *solicited_addr,
 			      bool router, bool solicited, bool override, bool inc_opt);

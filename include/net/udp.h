@@ -580,6 +580,7 @@ void udp_encap_disable(void);
 #if IS_ENABLED(CONFIG_IPV6)
 DECLARE_STATIC_KEY_FALSE(udpv6_encap_needed_key);
 void udpv6_encap_enable(void);
+void udpv6_encap_disable(void);
 #endif
 
 static inline struct sk_buff *udp_rcv_segment(struct sock *sk,

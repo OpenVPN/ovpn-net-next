@@ -602,6 +602,12 @@ void udpv6_encap_enable(void)
 }
 EXPORT_SYMBOL(udpv6_encap_enable);
 
+void udpv6_encap_disable(void)
+{
+	static_branch_dec(&udpv6_encap_needed_key);
+}
+EXPORT_SYMBOL(udpv6_encap_disable);
+
 /* Handler for tunnels with arbitrary destination ports: no socket lookup, go
  * through error handlers in encapsulations looking for a match.
  */
@@ -1823,7 +1829,7 @@ void udpv6_destroy_sock(struct sock *sk)
 			if (encap_destroy)
 				encap_destroy(sk);
 		}
-		if (udp_test_bit(ENCAP_ENABLED, sk)) {
+		if (udp_test_and_clear_bit(ENCAP_ENABLED, sk)) {
 			static_branch_dec(&udpv6_encap_needed_key);
 			udp_encap_disable();
 			udp_tunnel_cleanup_gro(sk);

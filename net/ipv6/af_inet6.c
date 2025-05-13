@@ -1049,6 +1049,7 @@ static const struct ipv6_stub ipv6_stub_impl = {
 	.fib6_rt_update	   = fib6_rt_update,
 	.ip6_del_rt	   = ip6_del_rt,
 	.udpv6_encap_enable = udpv6_encap_enable,
+	.udpv6_encap_disable = udpv6_encap_disable,
 	.ndisc_send_na = ndisc_send_na,
 #if IS_ENABLED(CONFIG_XFRM)
 	.xfrm6_local_rxpmtu = xfrm6_local_rxpmtu,

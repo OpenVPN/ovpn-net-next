@@ -2900,7 +2900,7 @@ void udp_destroy_sock(struct sock *sk)
 			if (encap_destroy)
 				encap_destroy(sk);
 		}
-		if (udp_test_bit(ENCAP_ENABLED, sk)) {
+		if (udp_test_and_clear_bit(ENCAP_ENABLED, sk)) {
 			static_branch_dec(&udp_encap_needed_key);
 			udp_tunnel_cleanup_gro(sk);
 		}

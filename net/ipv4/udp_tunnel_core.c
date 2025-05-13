@@ -98,6 +98,28 @@ void setup_udp_tunnel_sock(struct net *net, struct socket *sock,
 }
 EXPORT_SYMBOL_GPL(setup_udp_tunnel_sock);
 
+void cleanup_udp_tunnel_sock(struct sock *sk)
+{
+	/* Re-enable multicast loopback */
+	inet_set_bit(MC_LOOP, sk);
+
+	/* Disable CHECKSUM_UNNECESSARY to CHECKSUM_COMPLETE conversion */
+	inet_dec_convert_csum(sk);
+
+	udp_sk(sk)->encap_type = 0;
+	udp_sk(sk)->encap_rcv = NULL;
+	udp_sk(sk)->encap_err_rcv = NULL;
+	udp_sk(sk)->encap_err_lookup = NULL;
+	udp_sk(sk)->encap_destroy = NULL;
+	udp_sk(sk)->gro_receive = NULL;
+	udp_sk(sk)->gro_complete = NULL;
+
+	rcu_assign_sk_user_data(sk, NULL);
+	udp_tunnel_encap_disable(sk);
+	udp_tunnel_cleanup_gro(sk);
+}
+EXPORT_SYMBOL_GPL(cleanup_udp_tunnel_sock);
+
 void udp_tunnel_push_rx_port(struct net_device *dev, struct socket *sock,
 			     unsigned short type)
 {

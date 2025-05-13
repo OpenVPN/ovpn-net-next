@@ -116,6 +116,8 @@ struct udp_sock {
 	set_bit(UDP_FLAGS_##nr, &udp_sk(sk)->udp_flags)
 #define udp_test_and_set_bit(nr, sk)		\
 	test_and_set_bit(UDP_FLAGS_##nr, &udp_sk(sk)->udp_flags)
+#define udp_test_and_clear_bit(nr, sk)		\
+	test_and_clear_bit(UDP_FLAGS_##nr, &udp_sk(sk)->udp_flags)
 #define udp_clear_bit(nr, sk)			\
 	clear_bit(UDP_FLAGS_##nr, &udp_sk(sk)->udp_flags)
 #define udp_assign_bit(nr, sk, val)		\
