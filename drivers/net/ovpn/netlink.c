@@ -224,6 +224,17 @@ static int ovpn_nl_peer_precheck(struct ovpn_priv *ovpn,
 		return -EINVAL;
 	}
 
+	/* the local port cannot be set by userspace because the socket
+	 * being passed is already bound to one.
+	 * OVPN_A_PEER_LOCAL_PORT is for sending peer status only (check
+	 * ovpn_nl_send_peer())
+	 */
+	if (attrs[OVPN_A_PEER_LOCAL_PORT]) {
+		NL_SET_ERR_MSG_MOD(info->extack,
+				   "cannot specify local port (socket is bound already)");
+		return -EINVAL;
+	}
+
 	/* check that local and remote address families are the same even
 	 * after parsing v4mapped IPv6 addresses.
 	 * (if addresses are not provided, family will be AF_UNSPEC and
