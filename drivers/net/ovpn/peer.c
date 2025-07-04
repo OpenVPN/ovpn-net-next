@@ -882,6 +882,13 @@ bool ovpn_peer_check_by_src(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		rcu_read_unlock();
 		break;
 	case htons(ETH_P_IPV6):
+		/* Link-local addresses are not globally routable and thus
+		 * would always fail a standard RPF lookup. Allow them as
+		 * they are essential for IPv6 link operations (e.g. NDP)
+		 */
+		if (ipv6_addr_type(&ipv6_hdr(skb)->saddr) & IPV6_ADDR_LINKLOCAL)
+			return true;
+
 		addr6 = ovpn_nexthop_from_rt6(ovpn, ipv6_hdr(skb)->saddr);
 		rcu_read_lock();
 		match = (peer == ovpn_peer_get_by_vpn_addr6(ovpn, &addr6));
