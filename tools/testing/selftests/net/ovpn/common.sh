@@ -54,6 +54,25 @@ setup_ns() {
 	ip -n peer${1} link set tun${1} up
 }
 
+build_capture_filter() {
+	# match the first four bytes of the openvpn data payload
+	if [ "${PROTO}" == "UDP" ]; then
+		# For UDP, libpcap transport indexing only works for IPv4, so
+		# use an explicit IPv4 or IPv6 expression based on the peer
+		# address. The IPv6 branch assumes there are no extension
+		# headers in the outer packet.
+		if [[ "${2}" == *:* ]]; then
+			printf "ip6 and ip6[6] = 17 and ip6[48:4] = %s" "${1}"
+		else
+			printf "ip and udp[8:4] = %s" "${1}"
+		fi
+	else
+		# openvpn over TCP prepends a 2-byte packet length ahead of the
+		# DATA_V2 opcode, so skip it before matching the payload header
+		printf "ip and tcp[(((tcp[12] & 0xf0) >> 2) + 2):4] = %s" "${1}"
+	fi
+}
+
 setup_listener() {
 	file=$(mktemp)
 	PYTHONUNBUFFERED=1 ip netns exec peer${p} ${YNL_CLI} --family ovpn \
@@ -72,13 +91,14 @@ add_peer() {
 					data64.key
 			done
 		else
-			RADDR=$(awk "NR == ${1} {print \$2}" ${UDP_PEERS_FILE})
-			RPORT=$(awk "NR == ${1} {print \$3}" ${UDP_PEERS_FILE})
-			LPORT=$(awk "NR == ${1} {print \$5}" ${UDP_PEERS_FILE})
-			ip netns exec peer${1} ${OVPN_CLI} new_peer tun${1} ${1} ${LPORT} \
-				${RADDR} ${RPORT}
-			ip netns exec peer${1} ${OVPN_CLI} new_key tun${1} ${1} 1 0 ${ALG} 1 \
-				data64.key
+			TX_ID=$(awk "NR == ${1} {print \$2}" ${UDP_PEERS_FILE})
+			RADDR=$(awk "NR == ${1} {print \$3}" ${UDP_PEERS_FILE})
+			RPORT=$(awk "NR == ${1} {print \$4}" ${UDP_PEERS_FILE})
+			LPORT=$(awk "NR == ${1} {print \$6}" ${UDP_PEERS_FILE})
+			ip netns exec peer${1} ${OVPN_CLI} new_peer tun${1} \
+				${TX_ID} ${1} ${LPORT} ${RADDR} ${RPORT}
+			ip netns exec peer${1} ${OVPN_CLI} new_key tun${1} \
+				${TX_ID} 1 0 ${ALG} 1 data64.key
 		fi
 	else
 		if [ ${1} -eq 0 ]; then
@@ -90,8 +110,9 @@ add_peer() {
 			}) &
 			sleep 5
 		else
-			ip netns exec peer${1} ${OVPN_CLI} connect tun${1} ${1} 10.10.${1}.1 1 \
-				data64.key
+			TX_ID=$(awk "NR == ${1} {print \$2}" ${TCP_PEERS_FILE})
+			ip netns exec peer${1} ${OVPN_CLI} connect tun${1} ${TX_ID} ${1} \
+				10.10.${1}.1 1 data64.key
 		fi
 	fi
 }
