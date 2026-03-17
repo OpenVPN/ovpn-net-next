@@ -1034,6 +1034,14 @@ static int ovpn_peer_add_p2p(struct ovpn_priv *ovpn, struct ovpn_peer *peer)
  */
 int ovpn_peer_add(struct ovpn_priv *ovpn, struct ovpn_peer *peer)
 {
+	/* Prevent adding new peers while destroying the ovpn interface.
+	 * Failing to do so would end up holding the device reference
+	 * endlessly hostage of the new peer object with no chance of
+	 * release..
+	 */
+	if (ovpn->dev->reg_state >= NETREG_UNREGISTERING)
+		return -ENODEV;
+
 	switch (ovpn->mode) {
 	case OVPN_MODE_MP:
 		return ovpn_peer_add_mp(ovpn, peer);
