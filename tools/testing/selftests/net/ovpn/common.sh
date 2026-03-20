@@ -4,35 +4,35 @@
 #
 #  Author:	Antonio Quartulli <antonio@openvpn.net>
 
-UDP_PEERS_FILE=${UDP_PEERS_FILE:-udp_peers.txt}
-TCP_PEERS_FILE=${TCP_PEERS_FILE:-tcp_peers.txt}
+OVPN_UDP_PEERS_FILE=${OVPN_UDP_PEERS_FILE:-udp_peers.txt}
+OVPN_TCP_PEERS_FILE=${OVPN_TCP_PEERS_FILE:-tcp_peers.txt}
 OVPN_CLI=${OVPN_CLI:-./ovpn-cli}
-YNL_CLI=${YNL_CLI:-../../../../net/ynl/pyynl/cli.py}
-ALG=${ALG:-aes}
-PROTO=${PROTO:-UDP}
-FLOAT=${FLOAT:-0}
-SYMMETRIC_ID=${SYMMETRIC_ID:-0}
+OVPN_YNL_CLI=${OVPN_YNL_CLI:-../../../../net/ynl/pyynl/cli.py}
+OVPN_ALG=${OVPN_ALG:-aes}
+OVPN_PROTO=${OVPN_PROTO:-UDP}
+OVPN_FLOAT=${OVPN_FLOAT:-0}
+OVPN_SYMMETRIC_ID=${OVPN_SYMMETRIC_ID:-0}
 
-export ID_OFFSET=$(( 9 * (SYMMETRIC_ID == 0) ))
+export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
-JQ_FILTER='map(if type == "array" then .[] else . end) |
+OVPN_JQ_FILTER='map(if type == "array" then .[] else . end) |
 	map(select(.msg.peer | has("remote-ipv6") | not)) |
 	map(del(.msg.ifindex)) | sort_by(.msg.peer.id)[]'
-LAN_IP="11.11.11.11"
+OVPN_LAN_IP="11.11.11.11"
 
-declare -A tmp_jsons=()
-declare -A listener_pids=()
+declare -A OVPN_TMP_JSONS=()
+declare -A OVPN_LISTENER_PIDS=()
 
-create_ns() {
+ovpn_create_ns() {
 	ip netns add peer${1}
 }
 
-setup_ns() {
+ovpn_setup_ns() {
 	MODE="P2P"
 
 	if [ ${1} -eq 0 ]; then
 		MODE="MP"
-		for p in $(seq 1 ${NUM_PEERS}); do
+		for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 			ip link add veth${p} netns peer0 type veth peer name veth${p} netns peer${p}
 
 			ip -n peer0 addr add 10.10.${p}.1/24 dev veth${p}
@@ -48,9 +48,9 @@ setup_ns() {
 	ip netns exec peer${1} ${OVPN_CLI} new_iface tun${1} $MODE
 	ip -n peer${1} addr add ${2} dev tun${1}
 	# add a secondary IP to peer 1, to test a LAN behind a client
-	if [ ${1} -eq 1 -a -n "${LAN_IP}" ]; then
-		ip -n peer${1} addr add ${LAN_IP} dev tun${1}
-		ip -n peer0 route add ${LAN_IP} via $(echo ${2} |sed -e s'!/.*!!') dev tun0
+	if [ ${1} -eq 1 -a -n "${OVPN_LAN_IP}" ]; then
+		ip -n peer${1} addr add ${OVPN_LAN_IP} dev tun${1}
+		ip -n peer0 route add ${OVPN_LAN_IP} via $(echo ${2} |sed -e s'!/.*!!') dev tun0
 	fi
 	if [ -n "${3}" ]; then
 		ip -n peer${1} link set mtu ${3} dev tun${1}
@@ -58,9 +58,9 @@ setup_ns() {
 	ip -n peer${1} link set tun${1} up
 }
 
-build_capture_filter() {
+ovpn_build_capture_filter() {
 	# match the first four bytes of the openvpn data payload
-	if [ "${PROTO}" == "UDP" ]; then
+	if [ "${OVPN_PROTO}" == "UDP" ]; then
 		# For UDP, libpcap transport indexing only works for IPv4, so
 		# use an explicit IPv4 or IPv6 expression based on the peer
 		# address. The IPv6 branch assumes there are no extension
@@ -77,61 +77,61 @@ build_capture_filter() {
 	fi
 }
 
-setup_listener() {
+ovpn_setup_listener() {
 	file=$(mktemp)
-	PYTHONUNBUFFERED=1 ip netns exec peer${p} ${YNL_CLI} --family ovpn \
+	PYTHONUNBUFFERED=1 ip netns exec peer${p} ${OVPN_YNL_CLI} --family ovpn \
 		--subscribe peers --output-json --duration 40 > ${file} &
-	listener_pids[$1]=$!
-	tmp_jsons[$1]="${file}"
+	OVPN_LISTENER_PIDS[$1]=$!
+	OVPN_TMP_JSONS[$1]="${file}"
 }
 
-add_peer() {
+ovpn_add_peer() {
 	labels=("ASYMM" "SYMM")
-	M_ID=${labels[SYMMETRIC_ID]}
+	M_ID=${labels[OVPN_SYMMETRIC_ID]}
 
-	if [ "${PROTO}" == "UDP" ]; then
+	if [ "${OVPN_PROTO}" == "UDP" ]; then
 		if [ ${1} -eq 0 ]; then
 			ip netns exec peer0 ${OVPN_CLI} new_multi_peer tun0 1 \
-				${M_ID} ${UDP_PEERS_FILE}
+				${M_ID} ${OVPN_UDP_PEERS_FILE}
 
-			for p in $(seq 1 ${NUM_PEERS}); do
-				ip netns exec peer0 ${OVPN_CLI} new_key tun0 ${p} 1 0 ${ALG} 0 \
-					data64.key
+			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
+				ip netns exec peer0 ${OVPN_CLI} new_key tun0 ${p} 1 0 ${OVPN_ALG} \
+					0 data64.key
 			done
 		else
-			if [ "${SYMMETRIC_ID}" -eq 1 ]; then
+			if [ "${OVPN_SYMMETRIC_ID}" -eq 1 ]; then
 				PEER_ID=${1}
 				TX_ID="none"
 			else
 				PEER_ID=$(awk "NR == ${1} {print \$2}" \
-					${UDP_PEERS_FILE})
+					${OVPN_UDP_PEERS_FILE})
 				TX_ID=${1}
 			fi
-			RADDR=$(awk "NR == ${1} {print \$3}" ${UDP_PEERS_FILE})
-			RPORT=$(awk "NR == ${1} {print \$4}" ${UDP_PEERS_FILE})
-			LPORT=$(awk "NR == ${1} {print \$6}" ${UDP_PEERS_FILE})
+			RADDR=$(awk "NR == ${1} {print \$3}" ${OVPN_UDP_PEERS_FILE})
+			RPORT=$(awk "NR == ${1} {print \$4}" ${OVPN_UDP_PEERS_FILE})
+			LPORT=$(awk "NR == ${1} {print \$6}" ${OVPN_UDP_PEERS_FILE})
 			ip netns exec peer${1} ${OVPN_CLI} new_peer tun${1} \
 				${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} ${RPORT}
 			ip netns exec peer${1} ${OVPN_CLI} new_key tun${1} \
-				${PEER_ID} 1 0 ${ALG} 1 data64.key
+				${PEER_ID} 1 0 ${OVPN_ALG} 1 data64.key
 		fi
 	else
 		if [ ${1} -eq 0 ]; then
 			(ip netns exec peer0 ${OVPN_CLI} listen tun0 1 ${M_ID} \
-				${TCP_PEERS_FILE} && {
-				for p in $(seq 1 ${NUM_PEERS}); do
+				${OVPN_TCP_PEERS_FILE} && {
+				for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 					ip netns exec peer0 ${OVPN_CLI} new_key tun0 ${p} 1 0 \
-						${ALG} 0 data64.key
+						${OVPN_ALG} 0 data64.key
 				done
 			}) &
 			sleep 5
 		else
-			if [ "${SYMMETRIC_ID}" -eq 1 ]; then
+			if [ "${OVPN_SYMMETRIC_ID}" -eq 1 ]; then
 				PEER_ID=${1}
 				TX_ID="none"
 			else
 				PEER_ID=$(awk "NR == ${1} {print \$2}" \
-					${TCP_PEERS_FILE})
+					${OVPN_TCP_PEERS_FILE})
 				TX_ID=${1}
 			fi
 			ip netns exec peer${1} ${OVPN_CLI} connect tun${1} \
@@ -140,23 +140,23 @@ add_peer() {
 	fi
 }
 
-compare_ntfs() {
+ovpn_compare_ntfs() {
 	local diff_rc=0
 	local diff_file
 
-	if [ ${#tmp_jsons[@]} -gt 0 ]; then
+	if [ ${#OVPN_TMP_JSONS[@]} -gt 0 ]; then
 		suffix=""
-		[ "${SYMMETRIC_ID}" -eq 1 ] && suffix="${suffix}-symm"
-		[ "$FLOAT" == 1 ] && suffix="${suffix}-float"
+		[ "${OVPN_SYMMETRIC_ID}" -eq 1 ] && suffix="${suffix}-symm"
+		[ "$OVPN_FLOAT" == 1 ] && suffix="${suffix}-float"
 		expected="json/peer${1}${suffix}.json"
-		received="${tmp_jsons[$1]}"
+		received="${OVPN_TMP_JSONS[$1]}"
 		diff_file=$(mktemp)
 
-		kill -TERM ${listener_pids[$1]} || true
-		wait ${listener_pids[$1]} || true
+		kill -TERM ${OVPN_LISTENER_PIDS[$1]} || true
+		wait ${OVPN_LISTENER_PIDS[$1]} || true
 		printf "Checking notifications for peer ${1}... "
-		if diff <(jq -s "${JQ_FILTER}" ${expected}) \
-			<(jq -s "${JQ_FILTER}" ${received}) >"${diff_file}" 2>&1; then
+		if diff <(jq -s "${OVPN_JQ_FILTER}" ${expected}) \
+			<(jq -s "${OVPN_JQ_FILTER}" ${received}) >"${diff_file}" 2>&1; then
 			echo "OK"
 		else
 			diff_rc=$?
@@ -171,7 +171,7 @@ compare_ntfs() {
 	return "${diff_rc}"
 }
 
-cleanup() {
+ovpn_cleanup() {
 	# some ovpn-cli processes sleep in background so they need manual poking
 	killall $(basename ${OVPN_CLI}) 2>/dev/null || true
 
@@ -188,8 +188,8 @@ cleanup() {
 	done
 }
 
-if [ "${PROTO}" == "UDP" ]; then
-	NUM_PEERS=${NUM_PEERS:-$(wc -l ${UDP_PEERS_FILE} | awk '{print $1}')}
+if [ "${OVPN_PROTO}" == "UDP" ]; then
+	OVPN_NUM_PEERS=${OVPN_NUM_PEERS:-$(wc -l ${OVPN_UDP_PEERS_FILE} | awk '{print $1}')}
 else
-	NUM_PEERS=${NUM_PEERS:-$(wc -l ${TCP_PEERS_FILE} | awk '{print $1}')}
+	OVPN_NUM_PEERS=${OVPN_NUM_PEERS:-$(wc -l ${OVPN_TCP_PEERS_FILE} | awk '{print $1}')}
 fi

@@ -12,29 +12,29 @@ MARK=1056
 
 source ./common.sh
 
-cleanup
+ovpn_cleanup
 
 modprobe -q ovpn || true
 
-for p in $(seq 0 "${NUM_PEERS}"); do
-	create_ns "${p}"
+for p in $(seq 0 "${OVPN_NUM_PEERS}"); do
+	ovpn_create_ns "${p}"
 done
 
 for p in $(seq 0 3); do
-	setup_ns "${p}" 5.5.5.$((p + 1))/24
+	ovpn_setup_ns "${p}" 5.5.5.$((p + 1))/24
 done
 
 # add peer0 with mark
 ip netns exec peer0 "${OVPN_CLI}" new_multi_peer tun0 1 ASYMM \
-	"${UDP_PEERS_FILE}" \
+	"${OVPN_UDP_PEERS_FILE}" \
 	${MARK}
 for p in $(seq 1 3); do
-	ip netns exec peer0 "${OVPN_CLI}" new_key tun0 "${p}" 1 0 "${ALG}" 0 \
+	ip netns exec peer0 "${OVPN_CLI}" new_key tun0 "${p}" 1 0 "${OVPN_ALG}" 0 \
 		data64.key
 done
 
 for p in $(seq 1 3); do
-	add_peer "${p}"
+	ovpn_add_peer "${p}"
 done
 
 for p in $(seq 1 3); do
@@ -91,6 +91,6 @@ for p in $(seq 1 3); do
 	ip netns exec peer0 ping -qfc 500 -w 3 5.5.5.$((p + 1))
 done
 
-cleanup
+ovpn_cleanup
 
 modprobe -r ovpn || true
