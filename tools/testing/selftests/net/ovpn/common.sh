@@ -4,14 +4,18 @@
 #
 #  Author:	Antonio Quartulli <antonio@openvpn.net>
 
+OVPN_COMMON_DIR=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+source "$OVPN_COMMON_DIR/../../kselftest/ktap_helpers.sh"
+
 OVPN_UDP_PEERS_FILE=${OVPN_UDP_PEERS_FILE:-udp_peers.txt}
 OVPN_TCP_PEERS_FILE=${OVPN_TCP_PEERS_FILE:-tcp_peers.txt}
-OVPN_CLI=${OVPN_CLI:-./ovpn-cli}
-OVPN_YNL_CLI=${OVPN_YNL_CLI:-../../../../net/ynl/pyynl/cli.py}
+OVPN_CLI=${OVPN_CLI:-${OVPN_COMMON_DIR}/ovpn-cli}
+OVPN_YNL_CLI=${OVPN_YNL_CLI:-${OVPN_COMMON_DIR}/../../../../net/ynl/pyynl/cli.py}
 OVPN_ALG=${OVPN_ALG:-aes}
 OVPN_PROTO=${OVPN_PROTO:-UDP}
 OVPN_FLOAT=${OVPN_FLOAT:-0}
 OVPN_SYMMETRIC_ID=${OVPN_SYMMETRIC_ID:-0}
+OVPN_VERBOSE=${OVPN_VERBOSE:-0}
 
 export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
@@ -22,6 +26,110 @@ OVPN_LAN_IP="11.11.11.11"
 
 declare -A OVPN_TMP_JSONS=()
 declare -A OVPN_LISTENER_PIDS=()
+OVPN_CURRENT_STAGE=""
+
+ovpn_is_verbose() {
+	[[ "${OVPN_VERBOSE}" == "1" ]]
+}
+
+ovpn_log() {
+	ovpn_is_verbose || return 0
+	printf '%s\n' "$*"
+}
+
+ovpn_print_cmd_output() {
+	local output_file="$1"
+	local line
+
+	[[ -s "${output_file}" ]] || return 0
+
+	while IFS= read -r line; do
+		ovpn_log "${line}"
+	done < "${output_file}"
+}
+
+ovpn_cmd_run() {
+	local mode="$1"
+	local label="$2"
+	local output_file
+	local rc
+	local ret=0
+
+	shift 2
+
+	output_file=$(mktemp)
+	if "$@" >"${output_file}" 2>&1; then
+		rc=0
+	else
+		rc=$?
+	fi
+
+	case "${mode}" in
+	ok)
+		if [[ "${rc}" -ne 0 ]]; then
+			cat "${output_file}"
+			printf '%s\n' "${label}: command failed with rc=${rc}: $*"
+			ret="${rc}"
+		fi
+		;;
+	mayfail)
+		;;
+	fail)
+		[[ "${rc}" -eq 0 ]] && ret=1
+		;;
+	esac
+
+	if ovpn_is_verbose && [[ "${rc}" -eq 0 || "${mode}" != "ok" ]]; then
+		ovpn_print_cmd_output "${output_file}"
+	fi
+
+	rm -f "${output_file}"
+	return "${ret}"
+}
+
+ovpn_cmd_ok() {
+	ovpn_cmd_run ok "$@"
+}
+
+ovpn_cmd_mayfail() {
+	ovpn_cmd_run mayfail "$@"
+}
+
+ovpn_cmd_fail() {
+	ovpn_cmd_run fail "$@"
+}
+
+ovpn_run_bg() {
+	local pid_var="$1"
+
+	shift
+	if ovpn_is_verbose; then
+		"$@" &
+	else
+		"$@" >/dev/null 2>&1 &
+	fi
+
+	printf -v "${pid_var}" '%s' "$!"
+}
+
+ovpn_run_stage() {
+	local label="$1"
+
+	shift
+	OVPN_CURRENT_STAGE="${label}"
+	"$@"
+	OVPN_CURRENT_STAGE=""
+	ktap_test_pass "${label}"
+}
+
+ovpn_stage_err() {
+	# ERR trap is global under set -eE: only report failures that happen
+	# while ovpn_run_stage() is actively executing a stage body.
+	if [[ -n "${OVPN_CURRENT_STAGE}" ]]; then
+		ktap_test_fail "${OVPN_CURRENT_STAGE}"
+		OVPN_CURRENT_STAGE=""
+	fi
+}
 
 ovpn_create_ns() {
 	ip netns add peer${1}
@@ -78,11 +186,14 @@ ovpn_build_capture_filter() {
 }
 
 ovpn_setup_listener() {
+	local peer="$1"
+	local file
+
 	file=$(mktemp)
-	PYTHONUNBUFFERED=1 ip netns exec peer${p} ${OVPN_YNL_CLI} --family ovpn \
-		--subscribe peers --output-json --duration 40 > ${file} &
-	OVPN_LISTENER_PIDS[$1]=$!
-	OVPN_TMP_JSONS[$1]="${file}"
+	PYTHONUNBUFFERED=1 ip netns exec "peer${peer}" "${OVPN_YNL_CLI}" --family ovpn \
+		--subscribe peers --output-json --duration 40 > "${file}" 2>/dev/null &
+	OVPN_LISTENER_PIDS["${peer}"]=$!
+	OVPN_TMP_JSONS["${peer}"]="${file}"
 }
 
 ovpn_add_peer() {
@@ -152,8 +263,8 @@ ovpn_compare_ntfs() {
 		received="${OVPN_TMP_JSONS[$1]}"
 		diff_file=$(mktemp)
 
-		kill -TERM ${OVPN_LISTENER_PIDS[$1]} || true
-		wait ${OVPN_LISTENER_PIDS[$1]} || true
+		kill -TERM ${OVPN_LISTENER_PIDS[$1]} 2>/dev/null || true
+		wait ${OVPN_LISTENER_PIDS[$1]} 2>/dev/null || true
 		printf "Checking notifications for peer ${1}... "
 		if diff <(jq -s "${OVPN_JQ_FILTER}" ${expected}) \
 			<(jq -s "${OVPN_JQ_FILTER}" ${received}) >"${diff_file}" 2>&1; then
@@ -171,20 +282,49 @@ ovpn_compare_ntfs() {
 	return "${diff_rc}"
 }
 
+ovpn_stop_listener() {
+	local peer="$1"
+	local pid="${OVPN_LISTENER_PIDS[$peer]:-}"
+	local json="${OVPN_TMP_JSONS[$peer]:-}"
+
+	if [[ -n "${pid}" ]]; then
+		kill -TERM "${pid}" 2>/dev/null || true
+		wait "${pid}" 2>/dev/null || true
+		unset "OVPN_LISTENER_PIDS[$peer]"
+	fi
+
+	if [[ -n "${json}" ]]; then
+		rm -f "${json}" || true
+		unset "OVPN_TMP_JSONS[$peer]"
+	fi
+}
+
+ovpn_cleanup_peer_ns() {
+	local peer="$1"
+
+	if ! ip netns list | grep -qx "${peer}"; then
+		return 0
+	fi
+
+	ip -n "${peer}" link set tun${peer#peer} down 2>/dev/null || true
+	ip netns exec "${peer}" ${OVPN_CLI} del_iface tun${peer#peer} \
+		1>/dev/null 2>&1 || true
+	ip netns del "${peer}" 2>/dev/null || true
+}
+
 ovpn_cleanup() {
 	# some ovpn-cli processes sleep in background so they need manual poking
-	killall $(basename ${OVPN_CLI}) 2>/dev/null || true
+	killall "$(basename "${OVPN_CLI}")" 2>/dev/null || true
 
-	# netns peer0 is deleted without erasing ifaces first
-	for p in $(seq 1 10); do
-		ip -n peer${p} link set tun${p} down 2>/dev/null || true
-		ip netns exec peer${p} ${OVPN_CLI} del_iface tun${p} 2>/dev/null || true
+	for peer in "${!OVPN_LISTENER_PIDS[@]}"; do
+		ovpn_stop_listener "${peer}" 2>/dev/null
 	done
+
 	for p in $(seq 1 10); do
 		ip -n peer0 link del veth${p} 2>/dev/null || true
 	done
 	for p in $(seq 0 10); do
-		ip netns del peer${p} 2>/dev/null || true
+		ovpn_cleanup_peer_ns "peer${p}" 2>/dev/null
 	done
 }
 
