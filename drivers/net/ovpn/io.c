@@ -91,7 +91,13 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 
 	/* cause packet to be "received" by the interface */
 	pkt_len = skb->len;
+	/* we may get here in process context in case of TCP connections,
+	 * therefore we have to disable BHs to ensure gro_cells_receive()
+	 * doesn't enter deadlock
+	 */
+	local_bh_disable();
 	ret = gro_cells_receive(&peer->ovpn->gro_cells, skb);
+	local_bh_enable();
 	if (likely(ret == NET_RX_SUCCESS)) {
 		/* update RX stats with the size of decrypted packet */
 		ovpn_peer_stats_increment_rx(&peer->vpn_stats, pkt_len);
