@@ -626,26 +626,14 @@ addr_conflict:
 	goto unlock;
 }
 
-static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
-			     const struct ovpn_peer *peer, u32 portid, u32 seq,
-			     int flags)
+static int ovpn_nl_fill_peer(struct sk_buff *skb, const struct genl_info *info,
+			     const struct ovpn_peer *peer)
 {
 	const struct ovpn_bind *bind;
 	struct ovpn_socket *sock;
 	int ret = -EMSGSIZE;
-	struct nlattr *attr;
 	__be16 local_port;
-	void *hdr;
 	int id;
-
-	hdr = genlmsg_put(skb, portid, seq, &ovpn_nl_family, flags,
-			  OVPN_CMD_PEER_GET);
-	if (!hdr)
-		return -ENOBUFS;
-
-	attr = nla_nest_start(skb, OVPN_A_PEER);
-	if (!attr)
-		goto err;
 
 	rcu_read_lock();
 	sock = rcu_dereference(peer->sock);
@@ -654,7 +642,7 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 		goto err_unlock;
 	}
 
-	if (!net_eq(genl_info_net(info), sock_net(sock->sk))) {
+	if (info && !net_eq(genl_info_net(info), sock_net(sock->sk))) {
 		id = peernet2id_alloc(genl_info_net(info),
 				      sock_net(sock->sk),
 				      GFP_ATOMIC);
@@ -665,26 +653,26 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 	rcu_read_unlock();
 
 	if (nla_put_u32(skb, OVPN_A_PEER_ID, peer->id))
-		goto err;
+		return -EMSGSIZE;
 
 	if (nla_put_u32(skb, OVPN_A_PEER_TX_ID, peer->tx_id))
-		goto err;
+		return -EMSGSIZE;
 
 	if (peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY))
 		if (nla_put_in_addr(skb, OVPN_A_PEER_VPN_IPV4,
 				    peer->vpn_addrs.ipv4.s_addr))
-			goto err;
+			return -EMSGSIZE;
 
 	if (!ipv6_addr_equal(&peer->vpn_addrs.ipv6, &in6addr_any))
 		if (nla_put_in6_addr(skb, OVPN_A_PEER_VPN_IPV6,
 				     &peer->vpn_addrs.ipv6))
-			goto err;
+			return -EMSGSIZE;
 
 	if (nla_put_u32(skb, OVPN_A_PEER_KEEPALIVE_INTERVAL,
 			peer->keepalive_interval) ||
 	    nla_put_u32(skb, OVPN_A_PEER_KEEPALIVE_TIMEOUT,
 			peer->keepalive_timeout))
-		goto err;
+		return -EMSGSIZE;
 
 	rcu_read_lock();
 	bind = rcu_dereference(peer->bind);
@@ -732,14 +720,39 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 			 atomic64_read(&peer->link_stats.tx.bytes)) ||
 	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_PACKETS,
 			 atomic64_read(&peer->link_stats.tx.packets)))
+		return -EMSGSIZE;
+
+	return 0;
+err_unlock:
+	rcu_read_unlock();
+	return ret;
+}
+
+static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
+			     const struct ovpn_peer *peer, u32 portid, u32 seq,
+			     int flags)
+{
+	struct nlattr *attr;
+	int ret = -EMSGSIZE;
+	void *hdr;
+
+	hdr = genlmsg_put(skb, portid, seq, &ovpn_nl_family, flags,
+			  OVPN_CMD_PEER_GET);
+	if (!hdr)
+		return -ENOBUFS;
+
+	attr = nla_nest_start(skb, OVPN_A_PEER);
+	if (!attr)
+		goto err;
+
+	ret = ovpn_nl_fill_peer(skb, info, peer);
+	if (ret < 0)
 		goto err;
 
 	nla_nest_end(skb, attr);
 	genlmsg_end(skb, hdr);
 
 	return 0;
-err_unlock:
-	rcu_read_unlock();
 err:
 	genlmsg_cancel(skb, hdr);
 	return ret;
@@ -1273,7 +1286,8 @@ int ovpn_nl_peer_del_notify(struct ovpn_peer *peer)
 	if (nla_put_u32(msg, OVPN_A_PEER_DEL_REASON, peer->delete_reason))
 		goto err_cancel_msg;
 
-	if (nla_put_u32(msg, OVPN_A_PEER_ID, peer->id))
+	ret = ovpn_nl_fill_peer(msg, NULL, peer);
+	if (ret < 0)
 		goto err_cancel_msg;
 
 	nla_nest_end(msg, attr);

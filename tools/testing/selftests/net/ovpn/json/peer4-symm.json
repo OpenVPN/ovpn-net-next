@@ -1,1 +1,1 @@
-{"name": "peer-del-ntf", "msg": {"ifindex": 0, "peer": {"del-reason": "expired", "id": 4}}}
+{"name": "peer-del-ntf", "msg": {"ifindex": 0, "peer": {"del-reason": "expired", "id": 4, "tx-id": 4, "keepalive-interval": 3, "keepalive-timeout": 3, "vpn-rx-bytes": 0, "vpn-rx-packets": 0, "vpn-tx-bytes": 0, "vpn-tx-packets": 0, "link-rx-bytes": 0, "link-rx-packets": 0, "link-tx-bytes": 0, "link-tx-packets": 0}}}

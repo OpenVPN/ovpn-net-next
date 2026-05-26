@@ -19,9 +19,52 @@ OVPN_VERBOSE=${OVPN_VERBOSE:-0}
 
 export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
-OVPN_JQ_FILTER='map(if type == "array" then .[] else . end) |
-	map(select(.msg.peer | has("remote-ipv6") | not)) |
-	map(del(.msg.ifindex)) | sort_by(.msg.peer.id)[]'
+# Peer delete notifications include traffic counters whose values depend on
+# timing. zero_attr() sets a counter to zero only when that counter is present,
+# so missing stats still fail the comparison. zero_peer_stats is just the list
+# of counters to normalize. normalize_peer_del_ntf applies that to peer-del-ntf
+# messages and drops transport endpoint details, while leaving other
+# notifications unchanged.
+OVPN_JQ_FILTER='
+	def zero_attr(key):
+		if has(key) then .[key] = 0 else . end;
+
+	def zero_peer_stats:
+		zero_attr("vpn-rx-bytes") |
+		zero_attr("vpn-rx-packets") |
+		zero_attr("vpn-tx-bytes") |
+		zero_attr("vpn-tx-packets") |
+		zero_attr("link-rx-bytes") |
+		zero_attr("link-rx-packets") |
+		zero_attr("link-tx-bytes") |
+		zero_attr("link-tx-packets");
+
+	# Peers also float over IPv6 while the tests run, but those events are
+	# not deterministic in number or ordering and have never been part of
+	# the fixtures: the filter used to drop every notification carrying a
+	# remote-ipv6. That blanket rule cannot be used anymore now that
+	# peer-del-ntf embeds the full peer object, so drop IPv6 floats only.
+	def drop_ipv6_float:
+		select(.name != "peer-float-ntf"
+		       or (.msg.peer | has("remote-ipv6") | not));
+
+	def normalize_peer_del_ntf:
+		if .name == "peer-del-ntf" then
+			.msg.peer |= (
+				del(.["remote-ipv4"], .["remote-ipv6"],
+				    .["remote-ipv6-scope-id"], .["remote-port"],
+				    .["local-ipv4"], .["local-ipv6"],
+				    .["local-port"]) |
+				zero_peer_stats
+			)
+		else . end;
+
+	map(if type == "array" then .[] else . end) |
+	map(del(.msg.ifindex)) |
+	map(drop_ipv6_float) |
+	map(normalize_peer_del_ntf) |
+	sort_by(.msg.peer.id)[]'
+
 OVPN_LAN_IP="11.11.11.11"
 
 declare -A OVPN_TMP_JSONS=()
