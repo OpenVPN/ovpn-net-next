@@ -495,6 +495,9 @@ int ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 		return -EADDRNOTAVAIL;
 	}
 
+	/* the encrypted openvpn packet is the UDP tunnel payload */
+	skb_reset_inner_network_header(skb);
+
 	skb->dev = peer->ovpn->dev;
 	skb->mark = key.mark;
 	/* no checksum performed at this layer */
