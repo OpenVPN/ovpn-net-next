@@ -258,12 +258,16 @@ ovpn_add_peer() {
 		if [ ${1} -eq 0 ]; then
 			(ip netns exec "${server_ns}" ${OVPN_CLI} listen tun0 \
 				1 ${M_ID} ${OVPN_TCP_PEERS_FILE} && {
+				rc=0
 				for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 					ip netns exec "${server_ns}" \
 						${OVPN_CLI} new_key tun0 ${p} \
-						1 0 ${OVPN_ALG} 0 data64.key
+						1 0 ${OVPN_ALG} 0 data64.key \
+						|| rc=1
 				done
+				exit ${rc}
 			}) &
+			OVPN_TCP_KEYS_PID=$!
 			sleep 5
 		else
 			peer_ns="ovpn_peer${1}"
@@ -279,6 +283,39 @@ ovpn_add_peer() {
 				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 data64.key
 		fi
 	fi
+}
+
+# In TCP mode the server accepts the peers and installs their data keys from a
+# background subshell. "listen" returns once a connection has been accepted for
+# every entry of the peers file, so the key installation runs after the last
+# ovpn_add_peer() call. Wait for that subshell before generating any traffic,
+# otherwise the first packets may race the key installation and get dropped for
+# lack of a key.
+#
+# The wait is bounded: both the accept loop and the subsequent receive in
+# ovpn-cli are unbounded, so a peer that never connects (for instance when
+# OVPN_NUM_PEERS is smaller than the number of entries in the peers file) would
+# otherwise hang the whole test instead of failing.
+OVPN_TCP_KEYS_TIMEOUT=${OVPN_TCP_KEYS_TIMEOUT:-30}
+
+ovpn_wait_tcp_keys() {
+	local deadline
+
+	[ -n "${OVPN_TCP_KEYS_PID:-}" ] || return 0
+
+	deadline=$((SECONDS + OVPN_TCP_KEYS_TIMEOUT))
+	while kill -0 "${OVPN_TCP_KEYS_PID}" 2>/dev/null; do
+		if [ "${SECONDS}" -ge "${deadline}" ]; then
+			printf '%s\n' \
+				"server-side key setup still running after ${OVPN_TCP_KEYS_TIMEOUT}s"
+			kill "${OVPN_TCP_KEYS_PID}" 2>/dev/null
+			wait "${OVPN_TCP_KEYS_PID}" 2>/dev/null
+			return 1
+		fi
+		sleep 0.2
+	done
+
+	wait "${OVPN_TCP_KEYS_PID}"
 }
 
 ovpn_compare_ntfs() {
