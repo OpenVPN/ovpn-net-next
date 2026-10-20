@@ -205,3 +205,4 @@ obj-$(CONFIG_CRYPTO_SIMD) += crypto_simd.o
 obj-$(CONFIG_CRYPTO_KDF800108_CTR) += kdf_sp800108.o
 
 obj-$(CONFIG_CRYPTO_KRB5) += krb5/
+obj-$(CONFIG_CRYPTO_TEST_AEAD_SG) += test_aead_sg.o

@@ -244,6 +244,13 @@ config CRYPTO_KRB5ENC
 	  profile.  This is required for Kerberos 5-style encryption, used by
 	  sunrpc/NFS and rxrpc/AFS.
 
+config CRYPTO_TEST_AEAD_SG
+	tristate "AEAD scatterlist layout test module"
+	depends on m || EXPERT
+	select CRYPTO_AEAD
+	help
+	  Test module checking AEAD results across scatterlist layouts.
+
 config CRYPTO_BENCHMARK
 	tristate "Crypto benchmarking module"
 	depends on m || EXPERT
