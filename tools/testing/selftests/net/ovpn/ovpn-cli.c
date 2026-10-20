@@ -444,6 +444,8 @@ static int ovpn_parse_cipher(const char *cipher, struct ovpn_ctx *ctx)
 		ctx->cipher = OVPN_CIPHER_ALG_AES_GCM;
 	else if (strcmp(cipher, "chachapoly") == 0)
 		ctx->cipher = OVPN_CIPHER_ALG_CHACHA20_POLY1305;
+	else if (strcmp(cipher, "aegis128x4") == 0)
+		ctx->cipher = OVPN_CIPHER_ALG_AEGIS128X4;
 	else if (strcmp(cipher, "none") == 0)
 		ctx->cipher = OVPN_CIPHER_ALG_NONE;
 	else
@@ -958,8 +960,13 @@ nla_put_failure:
 static int ovpn_new_key(struct ovpn_ctx *ovpn)
 {
 	struct nlattr *keyconf, *key_dir;
+	int key_len = KEY_LEN;
 	struct nl_ctx *ctx;
 	int ret = -1;
+
+	/* AEGIS-128X4 uses a 128-bit key: take the first half of the key */
+	if (ovpn->cipher == OVPN_CIPHER_ALG_AEGIS128X4)
+		key_len = KEY_LEN / 2;
 
 	ctx = nl_ctx_alloc(ovpn, OVPN_CMD_KEY_NEW);
 	if (!ctx)
@@ -972,12 +979,12 @@ static int ovpn_new_key(struct ovpn_ctx *ovpn)
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_CIPHER_ALG, ovpn->cipher);
 
 	key_dir = nla_nest_start(ctx->nl_msg, OVPN_A_KEYCONF_ENCRYPT_DIR);
-	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, KEY_LEN, ovpn->key_enc);
+	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, key_len, ovpn->key_enc);
 	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_NONCE_TAIL, NONCE_LEN, ovpn->nonce);
 	nla_nest_end(ctx->nl_msg, key_dir);
 
 	key_dir = nla_nest_start(ctx->nl_msg, OVPN_A_KEYCONF_DECRYPT_DIR);
-	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, KEY_LEN, ovpn->key_dec);
+	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, key_len, ovpn->key_dec);
 	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_NONCE_TAIL, NONCE_LEN, ovpn->nonce);
 	nla_nest_end(ctx->nl_msg, key_dir);
 
@@ -1059,6 +1066,9 @@ static int ovpn_handle_key(struct nl_msg *msg, void (*arg)__always_unused)
 			break;
 		case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
 			fprintf(stderr, "chacha20poly1305\n");
+			break;
+		case OVPN_CIPHER_ALG_AEGIS128X4:
+			fprintf(stderr, "aegis128x4\n");
 			break;
 		default:
 			fprintf(stderr, "invalid (%u)\n",
@@ -1790,7 +1800,7 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tslot: either 1 (primary) or 2 (secondary)\n");
 	fprintf(stderr, "\tkey_id: an ID from 0 to 7\n");
 	fprintf(stderr,
-		"\tcipher: cipher to use, supported: aes (AES-GCM), chachapoly (CHACHA20POLY1305)\n");
+		"\tcipher: cipher to use, supported: aes (AES-GCM), chachapoly (CHACHA20POLY1305), aegis128x4 (AEGIS-128X4)\n");
 	fprintf(stderr,
 		"\tkey_dir: key direction, must 0 on one host and 1 on the other\n");
 	fprintf(stderr, "\tkey_file: file containing the pre-shared key\n");

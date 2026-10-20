@@ -33,6 +33,7 @@ TEST_FILES = \
 # end of TEST_FILES
 
 TEST_PROGS := \
+	test-aegis128x4.sh \
 	test-chachapoly.sh \
 	test-close-socket-tcp.sh \
 	test-close-socket.sh \
