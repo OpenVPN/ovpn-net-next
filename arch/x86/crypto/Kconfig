@@ -306,6 +306,23 @@ config CRYPTO_ARIA_GFNI_AVX512_X86_64
 
 	  Processes 64 blocks in parallel.
 
+config CRYPTO_AEGIS128_AESNI_AVX512_X86_64
+	tristate "AEAD ciphers: AEGIS-128X4 (VAES/AVX512)"
+	depends on 64BIT
+	select CRYPTO_AEAD
+	help
+	  AEGIS-128X4 AEAD algorithm (draft-irtf-cfrg-aegis-aead)
+
+	  AEGIS-128X4 is the 4-way parallel variant of AEGIS-128L.  It is
+	  not interoperable with AEGIS-128 (CRYPTO_AEGIS128).
+
+	  Architecture: x86_64 using:
+	  - VAES (Vector AES instructions)
+	  - AVX512 (Advanced Vector Extensions)
+	  - BMI2 (Bit Manipulation Instruction Set 2)
+
+	  Processes 4 AEGIS-128L states in parallel.
+
 config CRYPTO_AEGIS128_AESNI_SSE2
 	tristate "AEAD ciphers: AEGIS-128 (AES-NI/SSE4.1)"
 	depends on 64BIT

@@ -36,6 +36,10 @@ cast5-avx-x86_64-y := cast5-avx-x86_64-asm_64.o cast5_avx_glue.o
 obj-$(CONFIG_CRYPTO_CAST6_AVX_X86_64) += cast6-avx-x86_64.o
 cast6-avx-x86_64-y := cast6-avx-x86_64-asm_64.o cast6_avx_glue.o
 
+obj-$(CONFIG_CRYPTO_AEGIS128_AESNI_AVX512_X86_64) += aegis128x4-aesni-avx512.o
+aegis128x4-aesni-avx512-y := aegis128x4-aesni-avx512-asm.o \
+			     aegis128x4-aesni-avx512-glue.o
+
 obj-$(CONFIG_CRYPTO_AEGIS128_AESNI_SSE2) += aegis128-aesni.o
 aegis128-aesni-y := aegis128-aesni-asm.o aegis128-aesni-glue.o
 
