@@ -934,6 +934,7 @@ static int ovpn_nl_get_key_dir(struct genl_info *info, struct nlattr *key,
 	switch (cipher) {
 	case OVPN_CIPHER_ALG_AES_GCM:
 	case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
+	case OVPN_CIPHER_ALG_AEGIS128X4:
 		if (NL_REQ_ATTR_CHECK(info->extack, key, attrs,
 				      OVPN_A_KEYDIR_CIPHER_KEY) ||
 		    NL_REQ_ATTR_CHECK(info->extack, key, attrs,
@@ -943,7 +944,8 @@ static int ovpn_nl_get_key_dir(struct genl_info *info, struct nlattr *key,
 		dir->cipher_key = nla_data(attrs[OVPN_A_KEYDIR_CIPHER_KEY]);
 		dir->cipher_key_size = nla_len(attrs[OVPN_A_KEYDIR_CIPHER_KEY]);
 
-		/* These algorithms require a 96bit nonce,
+		/* These algorithms require a 96bit nonce (zero-padded to
+		 * 128bit for AEGIS-128X4),
 		 * Construct it by combining 4-bytes packet id and
 		 * 8-bytes nonce-tail from userspace
 		 */

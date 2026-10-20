@@ -16,6 +16,7 @@ enum ovpn_cipher_alg {
 	OVPN_CIPHER_ALG_NONE,
 	OVPN_CIPHER_ALG_AES_GCM,
 	OVPN_CIPHER_ALG_CHACHA20_POLY1305,
+	OVPN_CIPHER_ALG_AEGIS128X4,
 };
 
 enum ovpn_del_peer_reason {

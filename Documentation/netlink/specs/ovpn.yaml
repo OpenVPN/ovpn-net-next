@@ -19,7 +19,7 @@ definitions:
   -
     type: enum
     name: cipher-alg
-    entries: [none, aes-gcm, chacha20-poly1305]
+    entries: [none, aes-gcm, chacha20-poly1305, aegis128x4]
   -
     type: enum
     name: del-peer-reason

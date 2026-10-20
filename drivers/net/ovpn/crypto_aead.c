@@ -29,6 +29,12 @@
 
 #define ALG_NAME_AES		"gcm(aes)"
 #define ALG_NAME_CHACHAPOLY	"rfc7539(chacha20,poly1305)"
+#define ALG_NAME_AEGIS128X4	"aegis128x4"
+
+/* largest IV accepted: the AEGIS-128X family uses a 128-bit nonce, which
+ * gets the 96-bit OpenVPN nonce zero-padded
+ */
+#define OVPN_AEAD_MAX_IV_SIZE	16
 
 static int ovpn_aead_encap_overhead(const struct ovpn_crypto_key_slot *ks)
 {
@@ -56,9 +62,7 @@ static int ovpn_aead_encap_overhead(const struct ovpn_crypto_key_slot *ks)
 static unsigned int ovpn_aead_crypto_tmp_size(struct crypto_aead *tfm,
 					      const unsigned int nents)
 {
-	unsigned int len = OVPN_NONCE_SIZE;
-
-	DEBUG_NET_WARN_ON_ONCE(crypto_aead_ivsize(tfm) != OVPN_NONCE_SIZE);
+	unsigned int len = crypto_aead_ivsize(tfm);
 
 	/* min size for a buffer of ivsize, aligned to alignmask */
 	len += crypto_aead_alignmask(tfm) & ~(crypto_tfm_ctx_alignment() - 1);
@@ -168,6 +172,10 @@ static void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 	 * nonce
 	 */
 	ovpn_pktid_aead_write(pktid, ks->nonce_tail_xmit, iv);
+	/* algorithms with a larger IV get the nonce zero-padded */
+	if (crypto_aead_ivsize(ks->encrypt) > OVPN_NONCE_SIZE)
+		memset(iv + OVPN_NONCE_SIZE, 0,
+		       crypto_aead_ivsize(ks->encrypt) - OVPN_NONCE_SIZE);
 
 	/* add the packet opcode and wire nonce (the packet ID) as associated
 	 * data, with one store so that the 8-byte loads that follow (the copy
@@ -667,6 +675,9 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	memcpy(iv, skb->data + OVPN_OPCODE_SIZE, OVPN_NONCE_WIRE_SIZE);
 	memcpy(iv + OVPN_NONCE_WIRE_SIZE, ks->nonce_tail_recv,
 	       OVPN_NONCE_TAIL_SIZE);
+	if (crypto_aead_ivsize(ks->decrypt) > OVPN_NONCE_SIZE)
+		memset(iv + OVPN_NONCE_SIZE, 0,
+		       crypto_aead_ivsize(ks->decrypt) - OVPN_NONCE_SIZE);
 
 	/* setup async crypto operation */
 	aead_request_set_tfm(req, ks->decrypt);
@@ -710,13 +721,13 @@ static struct crypto_aead *ovpn_aead_init(const char *title,
 		goto error;
 	}
 
-	/* basic AEAD assumption
-	 * all current algorithms use OVPN_NONCE_SIZE.
-	 * ovpn_aead_crypto_tmp_size and ovpn_aead_encrypt/decrypt
-	 * expect this.
+	/* the OpenVPN nonce is OVPN_NONCE_SIZE bytes; algorithms with a larger
+	 * IV (up to OVPN_AEAD_MAX_IV_SIZE) get it zero-padded
 	 */
-	if (crypto_aead_ivsize(aead) != OVPN_NONCE_SIZE) {
-		pr_err("%s IV size must be %d\n", title, OVPN_NONCE_SIZE);
+	if (crypto_aead_ivsize(aead) < OVPN_NONCE_SIZE ||
+	    crypto_aead_ivsize(aead) > OVPN_AEAD_MAX_IV_SIZE) {
+		pr_err("%s unsupported IV size %u\n", title,
+		       crypto_aead_ivsize(aead));
 		ret = -EINVAL;
 		goto error;
 	}
@@ -765,6 +776,9 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 		break;
 	case OVPN_CIPHER_ALG_CHACHA20_POLY1305:
 		alg_name = ALG_NAME_CHACHAPOLY;
+		break;
+	case OVPN_CIPHER_ALG_AEGIS128X4:
+		alg_name = ALG_NAME_AEGIS128X4;
 		break;
 	default:
 		return ERR_PTR(-EOPNOTSUPP);
@@ -833,6 +847,8 @@ enum ovpn_cipher_alg ovpn_aead_crypto_alg(struct ovpn_crypto_key_slot *ks)
 		return OVPN_CIPHER_ALG_AES_GCM;
 	else if (!strcmp(alg_name, ALG_NAME_CHACHAPOLY))
 		return OVPN_CIPHER_ALG_CHACHA20_POLY1305;
+	else if (!strcmp(alg_name, ALG_NAME_AEGIS128X4))
+		return OVPN_CIPHER_ALG_AEGIS128X4;
 	else
 		return OVPN_CIPHER_ALG_NONE;
 }
