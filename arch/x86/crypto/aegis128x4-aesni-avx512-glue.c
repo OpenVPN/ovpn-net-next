@@ -29,6 +29,17 @@
 #define AEGIS128X4_MAX_AUTH_SIZE 32
 /* largest request processed with the state kept in registers */
 #define AEGIS128X4_FAST_MAX_LEN SZ_64K
+/*
+ * most scatterlist entries handled by the multi-entry path, bounding the time
+ * spent bouncing tiny entries with preemption disabled
+ */
+#define AEGIS128X4_SG_MAX_ENTS 64
+/*
+ * largest payload gathered from a scattered source into a contiguous
+ * destination for the one-shot code; beyond it the copy costs as much as the
+ * multi-entry path
+ */
+#define AEGIS128X4_GATHER_MAX_LEN SZ_4K
 
 struct aegis128x4_state {
 	u8 blocks[AEGIS128X4_STATE_BLOCKS][16 * AEGIS128X4_LANES];
@@ -177,9 +188,10 @@ static int crypto_aegis128x4_aesni_avx512_setauthsize(struct crypto_aead *tfm,
 }
 
 /*
- * Generic path, for requests whose associated data or payload are split across
- * several scatterlist entries, or that exceed AEGIS128X4_FAST_MAX_LEN.  Kept
- * out of line so that the fast path doesn't reserve the on-stack state.
+ * Generic path, for requests whose associated data is split across several
+ * scatterlist entries, whose scatterlists are very fragmented, or that exceed
+ * AEGIS128X4_FAST_MAX_LEN.  Kept out of line so that the fast path doesn't
+ * reserve the on-stack state.
  */
 static noinline int
 crypto_aegis128x4_aesni_avx512_crypt_slow(struct aead_request *req,
@@ -251,6 +263,145 @@ out:
 	return err;
 }
 
+/* position inside a scatterlist, for the multi-entry path */
+struct aegis128x4_sg_cursor {
+	struct scatterlist *sg;
+	unsigned int off;
+};
+
+static void aegis128x4_cursor_init(struct aegis128x4_sg_cursor *c,
+				   struct scatterlist *sg, unsigned int skip)
+{
+	while (skip >= sg->length) {
+		skip -= sg->length;
+		sg = sg_next(sg);
+	}
+	c->sg = sg;
+	c->off = skip;
+}
+
+/* bytes contiguous at the cursor, and their address */
+static __always_inline unsigned int
+aegis128x4_cursor_avail(struct aegis128x4_sg_cursor *c, u8 **addr)
+{
+	while (c->off >= c->sg->length) {
+		c->off -= c->sg->length;
+		c->sg = sg_next(c->sg);
+	}
+	*addr = (u8 *)sg_virt(c->sg) + c->off;
+	return c->sg->length - c->off;
+}
+
+/* copy @len bytes from/to the scatterlist at the cursor, advancing it */
+static void aegis128x4_cursor_copy(struct aegis128x4_sg_cursor *c, u8 *buf,
+				   unsigned int len, bool from_sg)
+{
+	while (len) {
+		u8 *addr;
+		unsigned int n = min(aegis128x4_cursor_avail(c, &addr), len);
+
+		if (from_sg)
+			memcpy(buf, addr, n);
+		else
+			memcpy(addr, buf, n);
+		buf += n;
+		len -= n;
+		c->off += n;
+	}
+}
+
+/*
+ * Multi-entry path: the associated data is contiguous in the first source
+ * entry, but the payload spans several scatterlist entries (e.g. the page
+ * fragments of an skb).  Walk the source and destination entries directly
+ * within a single kernel FPU section, processing the complete blocks found
+ * in place and bouncing only the blocks that straddle an entry boundary.
+ */
+static noinline int
+crypto_aegis128x4_aesni_avx512_crypt_sg(struct aead_request *req,
+					u8 tag_xor[AEGIS128X4_MAX_AUTH_SIZE],
+					unsigned int cryptlen, bool enc)
+{
+	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+	struct aegis128x4_ctx *ctx = crypto_aead_ctx(tfm);
+	unsigned int assoclen = req->assoclen;
+	struct aegis128x4_sg_cursor src, dst;
+	struct aegis128x4_state state;
+	u8 buf[AEGIS128X4_BLOCK_SIZE];
+	unsigned int left = cryptlen;
+
+	aegis128x4_cursor_init(&src, req->src, assoclen);
+	aegis128x4_cursor_init(&dst, req->dst, assoclen);
+
+	kernel_fpu_begin();
+	aegis128x4_aesni_avx512_init(&state, ctx->key, req->iv);
+
+	if (assoclen) {
+		const u8 *ad = sg_virt(req->src);
+		unsigned int full = round_down(assoclen, AEGIS128X4_BLOCK_SIZE);
+
+		if (full)
+			aegis128x4_aesni_avx512_ad(&state, ad, full);
+		if (assoclen > full) {
+			memcpy(buf, ad + full, assoclen - full);
+			memset(buf + assoclen - full, 0,
+			       AEGIS128X4_BLOCK_SIZE - (assoclen - full));
+			aegis128x4_aesni_avx512_ad(&state, buf,
+						   AEGIS128X4_BLOCK_SIZE);
+		}
+	}
+
+	while (left) {
+		unsigned int n, sn, dn;
+		u8 *sp, *dp;
+
+		sn = aegis128x4_cursor_avail(&src, &sp);
+		dn = aegis128x4_cursor_avail(&dst, &dp);
+		n = min3(sn, dn, left);
+
+		if (n >= AEGIS128X4_BLOCK_SIZE) {
+			n = round_down(n, AEGIS128X4_BLOCK_SIZE);
+			crypto_aegis128x4_aesni_avx512_process_crypt(&state,
+								     sp, dp,
+								     n, enc);
+			src.off += n;
+			dst.off += n;
+			left -= n;
+			continue;
+		}
+
+		if (n == left) {
+			/* the final partial block is contiguous */
+			crypto_aegis128x4_aesni_avx512_process_tail(&state, sp,
+								    dp, n,
+								    enc);
+			break;
+		}
+
+		/* a block straddling an entry boundary: bounce it */
+		n = min(left, AEGIS128X4_BLOCK_SIZE);
+		aegis128x4_cursor_copy(&src, buf, n, true);
+		if (n == AEGIS128X4_BLOCK_SIZE)
+			crypto_aegis128x4_aesni_avx512_process_crypt(&state,
+								     buf, buf,
+								     n, enc);
+		else
+			crypto_aegis128x4_aesni_avx512_process_tail(&state,
+								    buf, buf,
+								    n, enc);
+		aegis128x4_cursor_copy(&dst, buf, n, false);
+		left -= n;
+	}
+
+	aegis128x4_aesni_avx512_final(&state, tag_xor, assoclen, cryptlen,
+				      crypto_aead_authsize(tfm));
+	kernel_fpu_end();
+
+	memzero_explicit(buf, sizeof(buf));
+	memzero_explicit(&state, sizeof(state));
+	return 0;
+}
+
 /*
  * Return the address of the @len bytes found at offset @skip of @sg, or NULL
  * if they are not contiguous in a single entry.  This driver is 64-bit only,
@@ -282,6 +433,7 @@ crypto_aegis128x4_aesni_avx512_crypt(struct aead_request *req,
 	unsigned int assoclen = req->assoclen;
 	const u8 *ad = NULL, *src = NULL;
 	u8 *dst = NULL;
+	int nents;
 
 	/*
 	 * Fast path: the associated data is contiguous in the first source
@@ -290,6 +442,13 @@ crypto_aegis128x4_aesni_avx512_crypt(struct aead_request *req,
 	 * can be processed by a single assembly call that keeps the state in
 	 * registers.  Bound the request size to limit the time spent with
 	 * preemption disabled.
+	 *
+	 * If only the payload is split (e.g. the page fragments of an skb), a
+	 * small payload processed out of place into a contiguous destination
+	 * is gathered there and
+	 * processed in place by the one-shot code, otherwise the multi-entry
+	 * path walks the scatterlists directly; anything else goes through the
+	 * generic path.
 	 */
 	if (unlikely(assoclen > AEGIS128X4_FAST_MAX_LEN ||
 		     cryptlen > AEGIS128X4_FAST_MAX_LEN - assoclen))
@@ -305,8 +464,17 @@ crypto_aegis128x4_aesni_avx512_crypt(struct aead_request *req,
 		src = crypto_aegis128x4_aesni_avx512_sg_linear(req->src,
 							       assoclen,
 							       cryptlen);
-		if (unlikely(!src))
-			goto slow;
+		if (!src) {
+			if (req->dst == req->src ||
+			    cryptlen > AEGIS128X4_GATHER_MAX_LEN)
+				goto sg;
+			dst = crypto_aegis128x4_aesni_avx512_sg_linear(req->dst,
+								       assoclen,
+								       cryptlen);
+			if (!dst)
+				goto sg;
+			goto gather;
+		}
 
 		if (req->dst == req->src)
 			dst = (u8 *)src;
@@ -314,10 +482,24 @@ crypto_aegis128x4_aesni_avx512_crypt(struct aead_request *req,
 			dst = crypto_aegis128x4_aesni_avx512_sg_linear(req->dst,
 								       assoclen,
 								       cryptlen);
-		if (unlikely(!dst))
-			goto slow;
+		if (!dst)
+			goto sg;
 	}
 
+	goto oneshot;
+
+gather:
+	/*
+	 * Out of place with a scattered source but a contiguous destination
+	 * (e.g. encrypting skb fragments into a new linear buffer): gathering
+	 * the source into the destination and running the one-shot code in
+	 * place there is cheaper than the multi-entry path, which reloads the
+	 * state at every assembly call.
+	 */
+	memcpy_from_sglist(dst, req->src, assoclen, cryptlen);
+	src = dst;
+
+oneshot:
 	kernel_fpu_begin();
 	if (enc)
 		aegis128x4_aesni_avx512_enc_oneshot(ctx->key, req->iv, ad,
@@ -331,6 +513,20 @@ crypto_aegis128x4_aesni_avx512_crypt(struct aead_request *req,
 						    crypto_aead_authsize(tfm));
 	kernel_fpu_end();
 	return 0;
+
+sg:
+	/* the associated data is contiguous here, the payload is not */
+	nents = sg_nents_for_len(req->src, assoclen + cryptlen);
+	if (nents < 0 || nents > AEGIS128X4_SG_MAX_ENTS)
+		goto slow;
+	if (req->dst != req->src) {
+		nents = sg_nents_for_len(req->dst, assoclen + cryptlen);
+		if (nents < 0 || nents > AEGIS128X4_SG_MAX_ENTS)
+			goto slow;
+	}
+
+	return crypto_aegis128x4_aesni_avx512_crypt_sg(req, tag_xor, cryptlen,
+						       enc);
 
 slow:
 	return crypto_aegis128x4_aesni_avx512_crypt_slow(req, tag_xor,
