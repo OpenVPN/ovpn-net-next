@@ -11,6 +11,7 @@
 #define _NET_OVPN_OVPNPEER_H_
 
 #include <linux/seqlock.h>
+#include <linux/timekeeping.h>
 #include <net/dst_cache.h>
 #include <net/strparser.h>
 
@@ -182,6 +183,22 @@ static inline void ovpn_peer_put_many(struct ovpn_peer *peer, unsigned int n)
 {
 	if (refcount_sub_and_test(n, &peer->refcount.refcount))
 		ovpn_peer_release_kref(&peer->refcount);
+}
+
+/**
+ * ovpn_peer_touch - record the current time in a keepalive timestamp
+ * @ts: the timestamp, peer->last_recv or peer->last_sent
+ *
+ * The timestamp changes once a second: don't write the cache line, shared
+ * by the RX and TX paths, for every packet. Only moving it forward also
+ * keeps a racing writer from storing an older second.
+ */
+static inline void ovpn_peer_touch(time64_t *ts)
+{
+	time64_t now = ktime_get_boottime_seconds();
+
+	if (READ_ONCE(*ts) < now)
+		WRITE_ONCE(*ts, now);
 }
 
 struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id);

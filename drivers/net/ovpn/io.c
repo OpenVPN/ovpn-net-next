@@ -136,6 +136,7 @@ struct ovpn_rx_batch {
 	unsigned int bytes;
 	unsigned int packets;
 	unsigned int puts;
+	bool authenticated;
 };
 
 static DEFINE_PER_CPU(struct ovpn_rx_batch, ovpn_rx_batches);
@@ -156,6 +157,7 @@ void ovpn_rx_batch_begin(struct ovpn_peer *peer)
 	b->bytes = 0;
 	b->packets = 0;
 	b->puts = 0;
+	b->authenticated = false;
 }
 
 /**
@@ -171,6 +173,8 @@ void ovpn_rx_batch_end(void)
 	struct ovpn_peer *peer = b->peer;
 
 	b->peer = NULL;
+	if (b->authenticated)
+		ovpn_peer_touch(&peer->last_recv);
 	if (b->packets)
 		ovpn_peer_stats_add_rx(&peer->vpn_stats, b->bytes, b->packets);
 	if (b->puts)
@@ -259,6 +263,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	unsigned int payload_offset = 0;
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
+	struct ovpn_rx_batch *b;
 	struct ovpn_peer *peer;
 	u16 gso_size;
 	__be16 proto;
@@ -292,7 +297,11 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 
 	/* keep track of last received authenticated packet for keepalive */
-	WRITE_ONCE(peer->last_recv, ktime_get_boottime_seconds());
+	b = ovpn_rx_batch_get(peer);
+	if (b)
+		b->authenticated = true;
+	else
+		ovpn_peer_touch(&peer->last_recv);
 
 	rcu_read_lock();
 	sock = rcu_dereference(peer->sock);
@@ -502,7 +511,7 @@ void ovpn_encrypt_post(void *data, int ret)
 
 	ovpn_peer_stats_add_tx(&peer->link_stats, orig_len, packets);
 	/* keep track of last sent packet for keepalive */
-	WRITE_ONCE(peer->last_sent, ktime_get_boottime_seconds());
+	ovpn_peer_touch(&peer->last_sent);
 	/* skb passed down the stack - don't free it */
 	skb = NULL;
 err_unlock:
