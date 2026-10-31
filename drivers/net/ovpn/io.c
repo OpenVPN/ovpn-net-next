@@ -866,6 +866,21 @@ static bool ovpn_send_tcp_gso(struct ovpn_peer *peer, struct sk_buff *skb)
 	return true;
 }
 
+/* Whether to segment a GSO packet into linear skbs. skb_segment() then
+ * computes the inner checksum of each segment while copying its payload, and
+ * the AEAD encrypts one contiguous buffer per segment. With page fragments
+ * instead, each segment takes a separate checksum pass and reaches the AEAD as
+ * two chunks, its headers and its payload, which costs the AEAD more than the
+ * whole copy. Only segments fitting in a page are built linear: larger ones
+ * would need high-order atomic allocations, and their per-byte costs dominate
+ * anyway. The linear head bounds the headers skb_segment() copies.
+ */
+static bool ovpn_gso_linear(const struct sk_buff *skb)
+{
+	return SKB_HEAD_ALIGN(skb_headroom(skb) + skb_headlen(skb) +
+			      skb_shinfo(skb)->gso_size) <= PAGE_SIZE;
+}
+
 /* Send user data to the network
  */
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -938,12 +953,12 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	if (gso_in) {
-		/* force software segmentation and calculate each checksum
-		 * while allowing safe page-backed payload fragments to remain
-		 * non-linear
-		 */
+		/* force software segmentation and calculate each checksum */
 		features = netif_skb_features(skb);
 		features &= ~(NETIF_F_GSO_MASK | NETIF_F_CSUM_MASK);
+		/* frag-list children would only be linearized, not checksummed */
+		if (gso_out && ovpn_gso_linear(skb))
+			features &= ~NETIF_F_SG;
 		segments = skb_gso_segment(skb, features);
 		if (IS_ERR(segments)) {
 			ret = PTR_ERR(segments);
