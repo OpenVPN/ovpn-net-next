@@ -169,11 +169,14 @@ static void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 	 */
 	ovpn_pktid_aead_write(pktid, ks->nonce_tail_xmit, iv);
 
-	/* add the packet opcode and wire nonce as associated data */
+	/* add the packet opcode and wire nonce (the packet ID) as associated
+	 * data, with one store so that the 8-byte loads that follow (the copy
+	 * into the UDP GSO aggregate, the AEAD) can be forwarded from it
+	 */
 	op = ovpn_opcode_compose(OVPN_DATA_V2, ks->key_id, peer->tx_id);
 	BUILD_BUG_ON(sizeof(op) != OVPN_OPCODE_SIZE);
-	*(__force __be32 *)data = htonl(op);
-	memcpy(data + OVPN_OPCODE_SIZE, iv, OVPN_NONCE_WIRE_SIZE);
+	BUILD_BUG_ON(OVPN_OPCODE_SIZE + OVPN_NONCE_WIRE_SIZE != sizeof(u64));
+	put_unaligned_be64((u64)op << 32 | pktid, data);
 }
 
 /* Prepare the TCP prefix in reserved headroom so it participates in AEAD.
@@ -284,6 +287,36 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	return crypto_aead_encrypt(req);
 }
 
+/* Write the AAD at @offset of the UDP GSO aggregate @skb, whose data lives in
+ * page frags allocated by ovpn_gso_alloc() (never net_iov). The common case, a
+ * range within one lowmem frag, takes a single fixed-size copy:
+ * skb_store_bits() ends in a variable-length memcpy(), a string operation
+ * even for 8 bytes.
+ */
+static int ovpn_skb_store_aad(struct sk_buff *skb, unsigned int offset,
+			      const u8 *aad)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	unsigned int start = skb_headlen(skb), end, i;
+	const skb_frag_t *frag;
+
+	for (i = 0; offset >= start && i < shinfo->nr_frags; i++) {
+		frag = &shinfo->frags[i];
+		end = start + skb_frag_size(frag);
+		if (offset < end) {
+			if (offset + OVPN_AAD_SIZE > end ||
+			    PageHighMem(skb_frag_page(frag)))
+				break;
+			memcpy(skb_frag_address(frag) + (offset - start), aad,
+			       OVPN_AAD_SIZE);
+			return 0;
+		}
+		start = end;
+	}
+
+	return skb_store_bits(skb, offset, aad, OVPN_AAD_SIZE);
+}
+
 int ovpn_aead_encrypt_udp_gso(struct ovpn_peer *peer,
 			      struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
 			      struct sk_buff *gso_skb, unsigned int offset,
@@ -313,7 +346,7 @@ int ovpn_aead_encrypt_udp_gso(struct ovpn_peer *peer,
 
 	ovpn_aead_encrypt_header(peer, ks, pktid, iv, aad);
 
-	ret = skb_store_bits(gso_skb, offset, aad, OVPN_AAD_SIZE);
+	ret = ovpn_skb_store_aad(gso_skb, offset, aad);
 	if (unlikely(ret < 0))
 		return ret;
 
