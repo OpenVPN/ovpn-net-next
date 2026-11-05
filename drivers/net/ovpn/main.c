@@ -335,10 +335,16 @@ static int __init ovpn_init(void)
 		goto destroy_wq;
 	}
 
+	err = ovpn_tx_segs_alloc();
+	if (err) {
+		pr_err("ovpn: cannot allocate TX segment buffers: %d\n", err);
+		goto free_pools;
+	}
+
 	err = rtnl_link_register(&ovpn_link_ops);
 	if (err) {
 		pr_err("ovpn: can't register rtnl link ops: %d\n", err);
-		goto free_pools;
+		goto free_segs;
 	}
 
 	err = ovpn_nl_register();
@@ -351,6 +357,8 @@ static int __init ovpn_init(void)
 
 unreg_rtnl:
 	rtnl_link_unregister(&ovpn_link_ops);
+free_segs:
+	ovpn_tx_segs_free();
 free_pools:
 	ovpn_rx_pools_free();
 destroy_wq:
@@ -372,6 +380,7 @@ static __exit void ovpn_cleanup(void)
 
 	/* all interfaces are gone, so no record can be received anymore */
 	ovpn_rx_pools_free();
+	ovpn_tx_segs_free();
 }
 
 module_init(ovpn_init);
