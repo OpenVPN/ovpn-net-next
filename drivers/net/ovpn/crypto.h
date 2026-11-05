@@ -39,6 +39,7 @@ struct ovpn_peer_key_reset {
 
 struct ovpn_crypto_key_slot {
 	u8 key_id;
+	bool encrypt_sync;
 	bool decrypt_sync;
 
 	struct crypto_aead *encrypt;
