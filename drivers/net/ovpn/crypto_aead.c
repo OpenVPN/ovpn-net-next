@@ -583,16 +583,40 @@ err:
 	return 0;
 }
 
+/* fits the requests of all the supported algorithms, rfc7539 included */
+#define OVPN_AEAD_RX_SCRATCH_SIZE 1024
+
+struct ovpn_aead_rx_scratch {
+	local_lock_t bh_lock;
+	u8 buf[OVPN_AEAD_RX_SCRATCH_SIZE] ____cacheline_aligned;
+};
+
+static DEFINE_PER_CPU(struct ovpn_aead_rx_scratch, ovpn_aead_rx_scratches) = {
+	.bh_lock = INIT_LOCAL_LOCK(bh_lock),
+};
+
+/* A synchronous decryption with BHs disabled completes before another one
+ * can start on this CPU, so it can use a per-CPU buffer instead of
+ * allocating one for each record.
+ */
+static bool ovpn_aead_rx_scratch_fits(const struct ovpn_crypto_key_slot *ks,
+				      unsigned int size)
+{
+	return ks->decrypt_sync && in_softirq() && !in_hardirq() &&
+	       size <= OVPN_AEAD_RX_SCRATCH_SIZE;
+}
+
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb, bool tcp)
 {
 	const unsigned int tag_size = crypto_aead_authsize(ks->decrypt);
+	unsigned int payload_offset, tmp_size;
 	unsigned int aad_len = OVPN_AAD_SIZE;
 	int ret, payload_len, nfrags;
-	unsigned int payload_offset;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	struct scatterlist *sg;
+	bool scratch;
 	void *tmp;
 	u8 *aad, *iv;
 
@@ -627,13 +651,19 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	if (unlikely(nfrags + 2 > (MAX_SKB_FRAGS + 2)))
 		return -ENOSPC;
 
-	/* allocate temporary memory for iv, sg and req */
-	tmp = kmalloc(ovpn_aead_crypto_tmp_size(ks->decrypt, nfrags + 2),
-		      GFP_ATOMIC);
-	if (unlikely(!tmp))
-		return -ENOMEM;
+	/* temporary memory for iv, sg and req */
+	tmp_size = ovpn_aead_crypto_tmp_size(ks->decrypt, nfrags + 2);
+	scratch = ovpn_aead_rx_scratch_fits(ks, tmp_size);
+	if (scratch) {
+		local_lock_nested_bh(&ovpn_aead_rx_scratches.bh_lock);
+		tmp = this_cpu_ptr(&ovpn_aead_rx_scratches)->buf;
+	} else {
+		tmp = kmalloc(tmp_size, GFP_ATOMIC);
+		if (unlikely(!tmp))
+			return -ENOMEM;
 
-	ovpn_skb_cb(skb)->crypto_tmp = tmp;
+		ovpn_skb_cb(skb)->crypto_tmp = tmp;
+	}
 
 	iv = ovpn_aead_crypto_tmp_iv(ks->decrypt, tmp);
 	req = ovpn_aead_crypto_tmp_req(ks->decrypt, iv);
@@ -665,7 +695,7 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	if (unlikely(ret < 0)) {
 		netdev_err(peer->ovpn->dev,
 			   "decrypt: cannot map skb to sg: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
 	/* append auth_tag onto scatterlist */
@@ -687,7 +717,11 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	aead_request_set_ad(req, aad_len);
 
 	/* decrypt it */
-	return crypto_aead_decrypt(req);
+	ret = crypto_aead_decrypt(req);
+out:
+	if (scratch)
+		local_unlock_nested_bh(&ovpn_aead_rx_scratches.bh_lock);
+	return ret;
 }
 
 /* Initialize a struct crypto_aead object */
@@ -816,6 +850,7 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 		ks->decrypt = NULL;
 		goto destroy_ks;
 	}
+	ks->decrypt_sync = !crypto_tfm_is_async(crypto_aead_tfm(ks->decrypt));
 
 	memcpy(ks->nonce_tail_xmit, kc->encrypt.nonce_tail,
 	       OVPN_NONCE_TAIL_SIZE);
