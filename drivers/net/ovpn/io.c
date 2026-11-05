@@ -127,16 +127,26 @@ static int ovpn_tcp_gso_restore(struct sk_buff *skb, u16 gso_size)
 	return 0;
 }
 
-/* RX bookkeeping of the records a CPU delivers from one GRO list or one
- * parallel job: the peer's stats and references are updated once per batch
- * instead of with atomics on every record
+/* RX bookkeeping of the records a CPU delivers from one GRO list: the peer's
+ * stats and references are updated once per batch instead of with atomics on
+ * every record. The records of a GRO list share the outer addresses and the
+ * key ID (ovpn's GRO handler compares them) and usually the inner source
+ * address, so the batch also holds one key slot reference for the records
+ * decrypted synchronously, checks the peer endpoints once and remembers the
+ * last inner source that passed RPF.
  */
 struct ovpn_rx_batch {
 	struct ovpn_peer *peer;
+	struct ovpn_crypto_key_slot *ks;
 	unsigned int bytes;
 	unsigned int packets;
 	unsigned int puts;
 	bool authenticated;
+	bool endpoints_checked;
+	bool src4_ok;
+	bool src6_ok;
+	__be32 src4;
+	struct in6_addr src6;
 };
 
 static DEFINE_PER_CPU(struct ovpn_rx_batch, ovpn_rx_batches);
@@ -154,10 +164,14 @@ void ovpn_rx_batch_begin(struct ovpn_peer *peer)
 
 	DEBUG_NET_WARN_ON_ONCE(!in_softirq() || b->peer);
 	b->peer = peer;
+	b->ks = NULL;
 	b->bytes = 0;
 	b->packets = 0;
 	b->puts = 0;
 	b->authenticated = false;
+	b->endpoints_checked = false;
+	b->src4_ok = false;
+	b->src6_ok = false;
 }
 
 /**
@@ -173,6 +187,8 @@ void ovpn_rx_batch_end(void)
 	struct ovpn_peer *peer = b->peer;
 
 	b->peer = NULL;
+	if (b->ks)
+		ovpn_crypto_key_slot_put(b->ks);
 	if (b->authenticated)
 		ovpn_peer_touch(&peer->last_recv);
 	if (b->packets)
@@ -197,22 +213,12 @@ static struct ovpn_rx_batch *ovpn_rx_batch_get(struct ovpn_peer *peer)
 	return b->peer == peer ? b : NULL;
 }
 
-static void ovpn_rx_peer_put(struct ovpn_peer *peer)
-{
-	struct ovpn_rx_batch *b = ovpn_rx_batch_get(peer);
-
-	if (b)
-		b->puts++;
-	else
-		ovpn_peer_put(peer);
-}
-
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
-static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
+static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb,
+			      struct ovpn_rx_batch *b)
 {
-	struct ovpn_rx_batch *b;
 	unsigned int pkt_len, packets = 1;
 	int ret;
 
@@ -238,13 +244,14 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	}
 	/* we may get here in process context in case of TCP connections,
 	 * therefore we have to disable BHs to ensure gro_cells_receive()
-	 * and dev_dstats_rx_add() do not get corrupted or enter deadlock
+	 * and dev_dstats_rx_add() do not get corrupted or enter deadlock.
+	 * An open batch means they are disabled already.
 	 */
-	local_bh_disable();
+	if (!b)
+		local_bh_disable();
 	ret = gro_cells_receive(&peer->ovpn->gro_cells, skb);
 	if (likely(ret == NET_RX_SUCCESS)) {
 		/* update RX stats with the size of decrypted packet */
-		b = ovpn_rx_batch_get(peer);
 		if (b) {
 			b->bytes += pkt_len;
 			b->packets += packets;
@@ -254,7 +261,39 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 		}
 		ovpn_dev_dstats_rx_add(peer->ovpn->dev, pkt_len, packets);
 	}
-	local_bh_enable();
+	if (!b)
+		local_bh_enable();
+}
+
+/* RPF check, skipped for the inner source of the previous record if that
+ * passed it in this batch
+ */
+static bool ovpn_rx_check_src(struct ovpn_peer *peer, struct sk_buff *skb,
+			      struct ovpn_rx_batch *b)
+{
+	bool v4 = skb->protocol == htons(ETH_P_IP);
+
+	if (b) {
+		if (v4 && b->src4_ok && ip_hdr(skb)->saddr == b->src4)
+			return true;
+		if (!v4 && b->src6_ok &&
+		    ipv6_addr_equal(&ipv6_hdr(skb)->saddr, &b->src6))
+			return true;
+	}
+
+	if (!ovpn_peer_check_by_src(peer->ovpn, skb, peer))
+		return false;
+
+	if (b) {
+		if (v4) {
+			b->src4 = ip_hdr(skb)->saddr;
+			b->src4_ok = true;
+		} else {
+			b->src6 = ipv6_hdr(skb)->saddr;
+			b->src6_ok = true;
+		}
+	}
+	return true;
 }
 
 void ovpn_decrypt_post(void *data, int ret)
@@ -279,6 +318,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	gso_size = ovpn_skb_cb(skb)->gso_size;
 	ks = ovpn_skb_cb(skb)->ks;
 	peer = ovpn_skb_cb(skb)->peer;
+	b = ovpn_rx_batch_get(peer);
 
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
@@ -297,18 +337,22 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 
 	/* keep track of last received authenticated packet for keepalive */
-	b = ovpn_rx_batch_get(peer);
 	if (b)
 		b->authenticated = true;
 	else
 		ovpn_peer_touch(&peer->last_recv);
 
-	rcu_read_lock();
-	sock = rcu_dereference(peer->sock);
-	if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
-		/* check if this peer changed local or remote endpoint */
-		ovpn_peer_endpoints_update(peer, skb);
-	rcu_read_unlock();
+	/* the records of a batch share their outer addresses: check them once */
+	if (!b || !b->endpoints_checked) {
+		rcu_read_lock();
+		sock = rcu_dereference(peer->sock);
+		if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
+			/* check if this peer changed local or remote endpoint */
+			ovpn_peer_endpoints_update(peer, skb);
+		rcu_read_unlock();
+		if (b)
+			b->endpoints_checked = true;
+	}
 
 	/* point to encapsulated IP packet */
 	__skb_pull(skb, payload_offset);
@@ -358,7 +402,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		goto drop;
 
 	/* perform Reverse Path Filtering (RPF) */
-	if (unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
+	if (unlikely(!ovpn_rx_check_src(peer, skb, b))) {
 		if (skb->protocol == htons(ETH_P_IPV6))
 			net_dbg_ratelimited("%s: RPF dropped packet from peer %u, src: %pI6c\n",
 					    netdev_name(peer->ovpn->dev),
@@ -370,7 +414,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		goto drop;
 	}
 
-	ovpn_netdev_write(peer, skb);
+	ovpn_netdev_write(peer, skb, b);
 	/* skb is passed to upper layer - don't free it */
 	skb = NULL;
 drop:
@@ -378,9 +422,13 @@ drop:
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
 	kfree_skb(skb);
 drop_nocount:
-	if (likely(ks))
+	/* the batch releases its own key slot reference */
+	if (likely(ks) && (!b || ks != b->ks))
 		ovpn_crypto_key_slot_put(ks);
-	ovpn_rx_peer_put(peer);
+	if (b)
+		b->puts++;
+	else
+		ovpn_peer_put(peer);
 }
 
 /* decrypt a record and forward it to the device, its link stats already
@@ -388,12 +436,23 @@ drop_nocount:
  */
 void ovpn_recv_record(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 {
+	struct ovpn_rx_batch *b = ovpn_rx_batch_get(peer);
 	struct ovpn_crypto_key_slot *ks;
 	u8 key_id;
 
-	/* get the key slot matching the key ID in the received packet */
+	/* get the key slot matching the key ID in the received packet. The
+	 * batch reference covers only synchronous decryption, which completes
+	 * before the batch ends; a key replaced during the batch is still used
+	 * for the rest of it.
+	 */
 	key_id = ovpn_key_id_from_skb(skb);
-	ks = ovpn_crypto_key_id_to_slot(&peer->crypto, key_id);
+	if (b && b->ks && b->ks->key_id == key_id) {
+		ks = b->ks;
+	} else {
+		ks = ovpn_crypto_key_id_to_slot(&peer->crypto, key_id);
+		if (b && !b->ks && ks && ks->decrypt_sync)
+			b->ks = ks;
+	}
 	if (unlikely(!ks)) {
 		net_info_ratelimited("%s: no available key for peer %u, key-id: %u\n",
 				     netdev_name(peer->ovpn->dev), peer->id,
