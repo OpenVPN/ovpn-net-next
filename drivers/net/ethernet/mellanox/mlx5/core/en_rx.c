@@ -2093,6 +2093,12 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
 
 #define MLX5E_RX_PREFETCH_DIST	4
 
+/* TEST only: 0 = no look-ahead prefetch, 1 = v2 (current WQE only),
+ * 2 = also the first strides of the next WQE
+ */
+static int rx_prefetch_mode = 2;
+module_param(rx_prefetch_mode, int, 0644);
+
 /* A packet that fits the MTU takes one stride of a linear MPWQE, and the
  * device fills the strides in order: prefetch the packet
  * MLX5E_RX_PREFETCH_DIST strides ahead, and the line its skb_shared_info
@@ -2100,18 +2106,36 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *w
  */
 static void mlx5e_mpwrq_linear_prefetch(struct mlx5e_rq *rq,
 					struct mlx5e_mpw_info *wi,
+					struct mlx5_cqe64 *cqe,
 					u32 head_offset, u32 page_idx,
 					u16 cqe_bcnt)
 {
+	int mode = READ_ONCE(rx_prefetch_mode);
 	struct mlx5e_frag_page *frag_page;
 	void *va;
 
-	head_offset += MLX5E_RX_PREFETCH_DIST << rq->mpwqe.log_stride_sz;
-	page_idx += head_offset >> rq->mpwqe.page_shift;
-	if (page_idx >= rq->mpwqe.pages_per_wqe)
+	if (!mode)
 		return;
 
+	head_offset += MLX5E_RX_PREFETCH_DIST << rq->mpwqe.log_stride_sz;
+	page_idx += head_offset >> rq->mpwqe.page_shift;
 	head_offset &= (1 << rq->mpwqe.page_shift) - 1;
+	if (page_idx >= rq->mpwqe.pages_per_wqe) {
+		struct mlx5_wq_ll *wq = &rq->mpwqe.wq;
+		struct mlx5e_rx_wqe_ll *wqe;
+
+		/* the stride lies in the next WQE, which the device fills
+		 * next if it is already posted
+		 */
+		if (mode < 2 || wq->cur_sz < 2)
+			return;
+		wqe = mlx5_wq_ll_get_wqe(wq, be16_to_cpu(cqe->wqe_id));
+		wi = mlx5e_get_mpw_info(rq, be16_to_cpu(wqe->next.next_wqe_index));
+		page_idx -= rq->mpwqe.pages_per_wqe;
+		if (page_idx >= rq->mpwqe.pages_per_wqe)
+			return;
+	}
+
 	frag_page = &wi->alloc_units.frag_pages[page_idx];
 	va = netmem_address(frag_page->netmem) + head_offset;
 	prefetch(netmem_to_page(frag_page->netmem));
@@ -2141,7 +2165,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 		return NULL;
 	}
 
-	mlx5e_mpwrq_linear_prefetch(rq, wi, head_offset, page_idx, cqe_bcnt);
+	mlx5e_mpwrq_linear_prefetch(rq, wi, cqe, head_offset, page_idx, cqe_bcnt);
 
 	va             = netmem_address(frag_page->netmem) + head_offset;
 	data           = va + rx_headroom;
