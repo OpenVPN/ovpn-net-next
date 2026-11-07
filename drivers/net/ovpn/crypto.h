@@ -37,10 +37,13 @@ struct ovpn_peer_key_reset {
 	struct ovpn_key_config key;
 };
 
+struct ovpn_gcm_key;
+
 struct ovpn_crypto_key_slot {
 	u8 key_id;
 	bool encrypt_sync;
 	bool decrypt_sync;
+	struct ovpn_gcm_key *gcm_dec;	/* TEST */
 
 	struct crypto_aead *encrypt;
 	struct crypto_aead *decrypt;

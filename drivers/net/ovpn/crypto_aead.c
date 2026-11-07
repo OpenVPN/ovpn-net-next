@@ -26,6 +26,7 @@
 #include "peer.h"
 #include "proto.h"
 #include "skb.h"
+#include "gcm_lib.h"
 
 #define ALG_NAME_AES		"gcm(aes)"
 #define ALG_NAME_CHACHAPOLY	"rfc7539(chacha20,poly1305)"
@@ -728,6 +729,27 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	if (unlikely(nfrags + 2 > (MAX_SKB_FRAGS + 2)))
 		return -ENOSPC;
 
+	/* TEST: linear records go straight to the VAES-AVX512 code */
+	if (ks->gcm_dec && !skb_is_nonlinear(skb)) {
+		u8 nonce[OVPN_NONCE_SIZE];
+
+		aad = skb->data;
+		if (tcp) {
+			const struct ovpn_tcp_hdr *hdr;
+
+			aad -= sizeof(*hdr);
+			hdr = (const struct ovpn_tcp_hdr *)aad;
+			aad_len = OVPN_TCP_AAD_SIZE;
+			ovpn_skb_cb(skb)->gso_size = ntohs(hdr->gso_size);
+		}
+		memcpy(nonce, skb->data + OVPN_OPCODE_SIZE, OVPN_NONCE_WIRE_SIZE);
+		memcpy(nonce + OVPN_NONCE_WIRE_SIZE, ks->nonce_tail_recv,
+		       OVPN_NONCE_TAIL_SIZE);
+		return ovpn_gcm_decrypt(ks->gcm_dec, skb->data + payload_offset,
+					payload_len, aad, aad_len, nonce,
+					skb->data + OVPN_AAD_SIZE);
+	}
+
 	/* temporary memory for iv, sg and req */
 	tmp_size = ovpn_aead_crypto_tmp_size(ks->decrypt, nfrags + 2);
 	tmp = ovpn_aead_scratch_get(&ovpn_aead_rx_scratches, ks->decrypt_sync,
@@ -857,6 +879,7 @@ error:
 
 static void ovpn_aead_crypto_key_slot_free(struct ovpn_crypto_key_slot *ks)
 {
+	kfree_sensitive(ks->gcm_dec);
 	crypto_free_aead(ks->encrypt);
 	crypto_free_aead(ks->decrypt);
 }
@@ -904,6 +927,7 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 
 	ks->encrypt = NULL;
 	ks->decrypt = NULL;
+	ks->gcm_dec = NULL;	/* TEST */
 	INIT_RCU_WORK(&ks->free_work, ovpn_aead_crypto_key_slot_free_work);
 	kref_init(&ks->refcount);
 	ks->key_id = kc->key_id;
@@ -927,6 +951,19 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	}
 	ks->encrypt_sync = !crypto_tfm_is_async(crypto_aead_tfm(ks->encrypt));
 	ks->decrypt_sync = !crypto_tfm_is_async(crypto_aead_tfm(ks->decrypt));
+
+	/* TEST */
+	ks->gcm_dec = NULL;
+	if (kc->cipher_alg == OVPN_CIPHER_ALG_AES_GCM && ovpn_gcm_lib_usable() &&
+	    crypto_aead_authsize(ks->decrypt) == 16) {
+		ks->gcm_dec = kzalloc(sizeof(*ks->gcm_dec), GFP_KERNEL);
+		if (ks->gcm_dec &&
+		    ovpn_gcm_setkey(ks->gcm_dec, kc->decrypt.cipher_key,
+				    kc->decrypt.cipher_key_size)) {
+			kfree_sensitive(ks->gcm_dec);
+			ks->gcm_dec = NULL;
+		}
+	}
 
 	memcpy(ks->nonce_tail_xmit, kc->encrypt.nonce_tail,
 	       OVPN_NONCE_TAIL_SIZE);
