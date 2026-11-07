@@ -335,6 +335,17 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		goto out;
 	ovpn_aead_encrypt_header(peer, ks, pktid, iv, skb->data);
 
+	/* TEST: linear packets go straight to the VAES-AVX512 code */
+	if (ks->gcm_enc && !skb_is_nonlinear(skb)) {
+		u8 *payload = skb->data + OVPN_AAD_SIZE + tag_size;
+
+		ovpn_gcm_encrypt(ks->gcm_enc, payload, payload,
+				 skb->len - ovpn_aead_encap_overhead(ks), aad,
+				 aad_len, iv, skb->data + OVPN_AAD_SIZE);
+		ret = 0;
+		goto out;
+	}
+
 	/* AEAD Additional data */
 	sg_set_buf(sg, aad, aad_len);
 
@@ -350,6 +361,31 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 out:
 	ovpn_aead_scratch_put(&ovpn_aead_tx_scratches, scratch);
 	return ret;
+}
+
+/* TEST: the address of @len bytes at @offset of the UDP GSO aggregate @skb if
+ * they lie in one lowmem frag, NULL otherwise
+ */
+static u8 *ovpn_gso_frag_addr(struct sk_buff *skb, unsigned int offset,
+			      unsigned int len)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	unsigned int start = skb_headlen(skb), end, i;
+	const skb_frag_t *frag;
+
+	for (i = 0; offset >= start && i < shinfo->nr_frags; i++) {
+		frag = &shinfo->frags[i];
+		end = start + skb_frag_size(frag);
+		if (offset < end) {
+			if (offset + len > end ||
+			    PageHighMem(skb_frag_page(frag)))
+				return NULL;
+			return skb_frag_address(frag) + (offset - start);
+		}
+		start = end;
+	}
+
+	return NULL;
 }
 
 /* Write the AAD at @offset of the UDP GSO aggregate @skb, whose data lives in
@@ -429,6 +465,21 @@ static int __ovpn_aead_encrypt_udp_gso(struct ovpn_peer *peer,
 	ret = ovpn_skb_store_aad(gso_skb, offset, aad);
 	if (unlikely(ret < 0))
 		goto out;
+
+	/* TEST: linear source, destination in one frag */
+	if (ks->gcm_enc && (!skb || !skb_is_nonlinear(skb))) {
+		u8 *d = ovpn_gso_frag_addr(gso_skb, offset + OVPN_AAD_SIZE +
+					   OVPN_AUTH_TAG_SIZE, len);
+		u8 tag[OVPN_AUTH_TAG_SIZE];
+
+		if (d) {
+			ovpn_gcm_encrypt(ks->gcm_enc, d, skb ? skb->data : buf,
+					 len, aad, OVPN_AAD_SIZE, iv, tag);
+			ret = skb_store_bits(gso_skb, offset + OVPN_AAD_SIZE,
+					     tag, sizeof(tag));
+			goto out;
+		}
+	}
 
 	/* encrypt out of place from the original segmented skb directly into
 	 * its final range in the UDP GSO skb
@@ -880,6 +931,7 @@ error:
 static void ovpn_aead_crypto_key_slot_free(struct ovpn_crypto_key_slot *ks)
 {
 	kfree_sensitive(ks->gcm_dec);
+	kfree_sensitive(ks->gcm_enc);
 	crypto_free_aead(ks->encrypt);
 	crypto_free_aead(ks->decrypt);
 }
@@ -928,6 +980,7 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->encrypt = NULL;
 	ks->decrypt = NULL;
 	ks->gcm_dec = NULL;	/* TEST */
+	ks->gcm_enc = NULL;	/* TEST */
 	INIT_RCU_WORK(&ks->free_work, ovpn_aead_crypto_key_slot_free_work);
 	kref_init(&ks->refcount);
 	ks->key_id = kc->key_id;
@@ -962,6 +1015,14 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 				    kc->decrypt.cipher_key_size)) {
 			kfree_sensitive(ks->gcm_dec);
 			ks->gcm_dec = NULL;
+		}
+		ks->gcm_enc = kzalloc(sizeof(*ks->gcm_enc), GFP_KERNEL);
+		if (ks->gcm_enc &&
+		    (crypto_aead_authsize(ks->encrypt) != OVPN_AUTH_TAG_SIZE ||
+		     ovpn_gcm_setkey(ks->gcm_enc, kc->encrypt.cipher_key,
+				     kc->encrypt.cipher_key_size))) {
+			kfree_sensitive(ks->gcm_enc);
+			ks->gcm_enc = NULL;
 		}
 	}
 
