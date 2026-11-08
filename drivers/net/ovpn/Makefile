@@ -20,5 +20,4 @@ ovpn-y += socket.o
 ovpn-y += stats.o
 ovpn-y += tcp.o
 ovpn-y += udp.o
-ovpn-y += gcm_lib.o	# TEST
-ovpn-y += gcm-vaes-avx512.o	# TEST
+ovpn-$(CONFIG_X86_64) += gcm_lib.o gcm-vaes-avx512.o	# TEST

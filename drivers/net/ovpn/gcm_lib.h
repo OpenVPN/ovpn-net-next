@@ -8,6 +8,7 @@
 #define _NET_OVPN_GCM_LIB_H_
 
 #include <crypto/aes.h>
+#include <linux/errno.h>
 #include <linux/types.h>
 
 /* layout expected by gcm-vaes-avx512.S (struct aes_gcm_key_vaes_avx512) */
@@ -20,6 +21,7 @@ struct ovpn_gcm_key {
 	u64 padding[3][2];
 };
 
+#ifdef CONFIG_X86_64
 bool ovpn_gcm_lib_usable(void);
 int ovpn_gcm_setkey(struct ovpn_gcm_key *key, const u8 *raw, unsigned int len);
 int ovpn_gcm_decrypt(const struct ovpn_gcm_key *key, u8 *data,
@@ -28,5 +30,33 @@ int ovpn_gcm_decrypt(const struct ovpn_gcm_key *key, u8 *data,
 void ovpn_gcm_encrypt(const struct ovpn_gcm_key *key, u8 *dst, const u8 *src,
 		      unsigned int len, const u8 *aad, unsigned int aad_len,
 		      const u8 iv[12], u8 tag[16]);
+#else
+/* no key is ever set up: the other helpers are never called */
+static inline bool ovpn_gcm_lib_usable(void)
+{
+	return false;
+}
+
+static inline int ovpn_gcm_setkey(struct ovpn_gcm_key *key, const u8 *raw,
+				  unsigned int len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int ovpn_gcm_decrypt(const struct ovpn_gcm_key *key, u8 *data,
+				   unsigned int len, const u8 *aad,
+				   unsigned int aad_len, const u8 iv[12],
+				   const u8 tag[16])
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void ovpn_gcm_encrypt(const struct ovpn_gcm_key *key, u8 *dst,
+				    const u8 *src, unsigned int len,
+				    const u8 *aad, unsigned int aad_len,
+				    const u8 iv[12], u8 tag[16])
+{
+}
+#endif
 
 #endif /* _NET_OVPN_GCM_LIB_H_ */
