@@ -210,16 +210,30 @@ static inline int udp_tunnel_handle_offloads(struct sk_buff *skb, bool udp_csum)
 #if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
 void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add);
 void udp_tunnel_update_gro_rcv(struct sock *sk, bool add);
+void udp_tunnel_gro_lookup_add(struct sock *sk);
+void udp_tunnel_gro_lookup_bind(struct sock *sk, unsigned short port);
 #else
 static inline void udp_tunnel_update_gro_lookup(struct net *net,
 						struct sock *sk, bool add) {}
 static inline void udp_tunnel_update_gro_rcv(struct sock *sk, bool add) {}
+static inline void udp_tunnel_gro_lookup_add(struct sock *sk) {}
+static inline void udp_tunnel_gro_lookup_bind(struct sock *sk,
+					      unsigned short port) {}
 #endif
 
 static inline void udp_tunnel_cleanup_gro(struct sock *sk)
 {
 	udp_tunnel_update_gro_rcv(sk, false);
 	udp_tunnel_update_gro_lookup(sock_net(sk), sk, false);
+}
+
+/* @sk is changing its address, device, peer or port: it may stop being the
+ * only socket matching its port, drop it from the GRO lookup fast path.
+ */
+static inline void udp_tunnel_gro_lookup_drop(struct sock *sk)
+{
+	if (udp_test_bit(ENCAP_ENABLED, sk))
+		udp_tunnel_update_gro_lookup(sock_net(sk), sk, false);
 }
 
 static inline void udp_tunnel_encap_enable(struct sock *sk)

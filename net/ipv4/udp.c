@@ -321,6 +321,9 @@ found:
 			goto fail_unlock;
 		}
 
+		if (static_branch_unlikely(&udp_encap_needed_key))
+			udp_tunnel_gro_lookup_bind(sk, snum);
+
 		sock_set_flag(sk, SOCK_RCU_FREE);
 
 		sk_add_node_rcu(sk, &hslot->head);
@@ -2171,6 +2174,7 @@ static int udp_connect(struct sock *sk, struct sockaddr_unsized *uaddr,
 	int res;
 
 	lock_sock(sk);
+	udp_tunnel_gro_lookup_drop(sk);
 	res = __ip4_datagram_connect(sk, uaddr, addr_len);
 	if (!res)
 		udp4_hash4(sk);
@@ -2238,6 +2242,8 @@ int udp_disconnect(struct sock *sk, int flags)
 
 void udp_lib_unhash(struct sock *sk)
 {
+	udp_tunnel_gro_lookup_drop(sk);
+
 	if (sk_hashed(sk)) {
 		struct udp_hslot *hslot, *hslot2;
 		struct net *net = sock_net(sk);
@@ -2272,6 +2278,8 @@ void udp_lib_unhash(struct sock *sk)
  */
 void udp_lib_rehash(struct sock *sk, u16 newhash, u16 newhash4)
 {
+	udp_tunnel_gro_lookup_drop(sk);
+
 	if (sk_hashed(sk)) {
 		struct udp_hslot *hslot, *hslot2, *nhslot2;
 		struct net *net = sock_net(sk);

@@ -1303,6 +1303,7 @@ static int udpv6_connect(struct sock *sk, struct sockaddr_unsized *uaddr,
 	int res;
 
 	lock_sock(sk);
+	udp_tunnel_gro_lookup_drop(sk);
 	res = __ip6_datagram_connect(sk, uaddr, addr_len);
 	if (!res)
 		udp6_hash4(sk);

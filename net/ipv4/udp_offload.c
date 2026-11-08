@@ -7,6 +7,7 @@
  */
 
 #include <linux/skbuff.h>
+#include <net/addrconf.h>
 #include <net/gro.h>
 #include <net/gso.h>
 #include <net/udp.h>
@@ -50,32 +51,142 @@ static struct udp_tunnel_type_entry udp_tunnel_gro_types[UDP_MAX_TUNNEL_TYPES];
 static unsigned int udp_tunnel_gro_type_nr;
 static DEFINE_SPINLOCK(udp_tunnel_gro_lock);
 
+/* The socket for the fast path of @udp_tunnel_gro. Every registered socket is
+ * the only one matching its port, but kernel ones keep the fast path they had
+ * before user-space ones could be registered: a user-space socket is used
+ * only when it is the only one.
+ */
+static struct sock *udp_tunnel_gro_pick(struct udp_tunnel_gro *udp_tunnel_gro)
+{
+	struct sock *kern = NULL, *user = NULL, *sk;
+	int nkern = 0, nuser = 0;
+	struct udp_sock *up;
+
+	hlist_for_each_entry(up, &udp_tunnel_gro->list, tunnel_list) {
+		sk = (struct sock *)up;
+		if (sk->sk_kern_sock) {
+			kern = sk;
+			nkern++;
+		} else {
+			user = sk;
+			nuser++;
+		}
+	}
+
+	if (nkern)
+		return nkern == 1 ? kern : NULL;
+
+	return nuser == 1 ? user : NULL;
+}
+
+static void udp_tunnel_gro_update_sk(struct udp_tunnel_gro *udp_tunnel_gro)
+{
+	rcu_assign_pointer(udp_tunnel_gro->sk,
+			   udp_tunnel_gro_pick(udp_tunnel_gro));
+}
+
 void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add)
 {
 	bool is_ipv6 = sk->sk_family == AF_INET6;
-	struct udp_sock *tup, *up = udp_sk(sk);
+	struct udp_sock *up = udp_sk(sk);
 	struct udp_tunnel_gro *udp_tunnel_gro;
 
 	spin_lock(&udp_tunnel_gro_lock);
 	udp_tunnel_gro = &net->ipv4.udp_tunnel_gro[is_ipv6];
 	if (add)
-		hlist_add_head(&up->tunnel_list, &udp_tunnel_gro->list);
+		hlist_add_head_rcu(&up->tunnel_list, &udp_tunnel_gro->list);
 	else if (up->tunnel_list.pprev)
-		hlist_del_init(&up->tunnel_list);
+		hlist_del_init_rcu(&up->tunnel_list);
 
-	if (udp_tunnel_gro->list.first &&
-	    !udp_tunnel_gro->list.first->next) {
-		tup = hlist_entry(udp_tunnel_gro->list.first, struct udp_sock,
-				  tunnel_list);
-
-		rcu_assign_pointer(udp_tunnel_gro->sk, (struct sock *)tup);
-	} else {
-		RCU_INIT_POINTER(udp_tunnel_gro->sk, NULL);
-	}
-
+	udp_tunnel_gro_update_sk(udp_tunnel_gro);
 	spin_unlock(&udp_tunnel_gro_lock);
 }
 EXPORT_SYMBOL_GPL(udp_tunnel_update_gro_lookup);
+
+/* Can @sk match the packets looked up in @slot (0: IPv4, 1: IPv6)? */
+static bool udp_tunnel_gro_slot_match(const struct sock *sk, int slot)
+{
+	if (slot)
+		return sk->sk_family == AF_INET6;
+
+	return sk->sk_family == AF_INET || !ipv6_only_sock(sk);
+}
+
+/* Add @sk to the fast path if no other socket can match its port. Under the
+ * port hash slot lock, so that a concurrent bind() sees it, see
+ * udp_tunnel_gro_lookup_bind().
+ */
+void udp_tunnel_gro_lookup_add(struct sock *sk)
+{
+	int slot = sk->sk_family == AF_INET6;
+	struct udp_tunnel_gro *udp_tunnel_gro;
+	struct net *net = sock_net(sk);
+	struct udp_hslot *hslot;
+	struct sock *sk2;
+
+	if (!sk->sk_num)
+		return;
+
+	hslot = udp_hashslot(net->ipv4.udp_table, net, sk->sk_num);
+	spin_lock_bh(&hslot->lock);
+	if (!sk_hashed(sk) || udp_sk(sk)->tunnel_list.pprev ||
+	    sk->sk_dport || sk->sk_bound_dev_if || !inet_rcv_saddr_any(sk) ||
+	    sk->sk_reuse || sk->sk_reuseport)
+		goto out;
+
+	sk_for_each(sk2, &hslot->head)
+		if (sk2 != sk && net_eq(sock_net(sk2), net) &&
+		    udp_sk(sk2)->udp_port_hash == sk->sk_num &&
+		    udp_tunnel_gro_slot_match(sk2, slot))
+			goto out;
+
+	spin_lock(&udp_tunnel_gro_lock);
+	udp_tunnel_gro = &net->ipv4.udp_tunnel_gro[slot];
+	hlist_add_head_rcu(&udp_sk(sk)->tunnel_list, &udp_tunnel_gro->list);
+	udp_tunnel_gro_update_sk(udp_tunnel_gro);
+	spin_unlock(&udp_tunnel_gro_lock);
+out:
+	spin_unlock_bh(&hslot->lock);
+}
+EXPORT_SYMBOL_GPL(udp_tunnel_gro_lookup_add);
+
+/* @sk is being bound to @port, under the port hash slot lock: the fast path
+ * sockets using the same port for a family @sk can match may not be the only
+ * ones matching it anymore, drop them.
+ */
+void udp_tunnel_gro_lookup_bind(struct sock *sk, unsigned short port)
+{
+	struct udp_tunnel_gro *udp_tunnel_gro;
+	struct net *net = sock_net(sk);
+	struct hlist_node *tmp;
+	struct udp_sock *up;
+	bool found;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(net->ipv4.udp_tunnel_gro); i++) {
+		udp_tunnel_gro = &net->ipv4.udp_tunnel_gro[i];
+		if (!udp_tunnel_gro_slot_match(sk, i))
+			continue;
+
+		/* sockets on @port are only added under the lock we hold */
+		found = false;
+		rcu_read_lock();
+		hlist_for_each_entry_rcu(up, &udp_tunnel_gro->list, tunnel_list)
+			found |= up->inet.inet_num == port;
+		rcu_read_unlock();
+		if (!found)
+			continue;
+
+		spin_lock(&udp_tunnel_gro_lock);
+		hlist_for_each_entry_safe(up, tmp, &udp_tunnel_gro->list,
+					  tunnel_list)
+			if (up->inet.inet_num == port)
+				hlist_del_init_rcu(&up->tunnel_list);
+
+		udp_tunnel_gro_update_sk(udp_tunnel_gro);
+		spin_unlock(&udp_tunnel_gro_lock);
+	}
+}
 
 void udp_tunnel_update_gro_rcv(struct sock *sk, bool add)
 {
