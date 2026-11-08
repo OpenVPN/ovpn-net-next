@@ -51,38 +51,69 @@ static struct udp_tunnel_type_entry udp_tunnel_gro_types[UDP_MAX_TUNNEL_TYPES];
 static unsigned int udp_tunnel_gro_type_nr;
 static DEFINE_SPINLOCK(udp_tunnel_gro_lock);
 
-/* The socket for the fast path of @udp_tunnel_gro. Every registered socket is
- * the only one matching its port, but kernel ones keep the fast path they had
- * before user-space ones could be registered: a user-space socket is used
- * only when it is the only one.
- */
-static struct sock *udp_tunnel_gro_pick(struct udp_tunnel_gro *udp_tunnel_gro)
+/* Can @sk match the packets looked up in @slot (0: IPv4, 1: IPv6)? */
+static bool udp_tunnel_gro_slot_match(const struct sock *sk, int slot)
 {
-	struct sock *kern = NULL, *user = NULL, *sk;
-	int nkern = 0, nuser = 0;
+	if (slot)
+		return sk->sk_family == AF_INET6;
+
+	return sk->sk_family == AF_INET || !ipv6_only_sock(sk);
+}
+
+/* Can @sk and @sk2 match packets of the same family? */
+static bool udp_tunnel_gro_family_overlap(const struct sock *sk,
+					  const struct sock *sk2)
+{
+	return (udp_tunnel_gro_slot_match(sk, 0) &&
+		udp_tunnel_gro_slot_match(sk2, 0)) ||
+	       (udp_tunnel_gro_slot_match(sk, 1) &&
+		udp_tunnel_gro_slot_match(sk2, 1));
+}
+
+/* The socket for the fast path of @slot, among the registered ones matching
+ * its packets: sockets are listed by family, dual-stack ones (on the IPv6
+ * list) match IPv4 packets too. Every registered socket is the only one
+ * matching its port, but kernel sockets of the slot family keep the fast
+ * path they had, then come kernel dual-stack sockets, then user-space ones:
+ * the first non-empty tier is used, if it has a single socket.
+ */
+static struct sock *udp_tunnel_gro_pick(struct net *net, int slot)
+{
+	int family = slot ? AF_INET6 : AF_INET;
+	struct sock *pick[3] = {}, *sk;
+	int n[3] = {}, i, tier;
 	struct udp_sock *up;
 
-	hlist_for_each_entry(up, &udp_tunnel_gro->list, tunnel_list) {
-		sk = (struct sock *)up;
-		if (sk->sk_kern_sock) {
-			kern = sk;
-			nkern++;
-		} else {
-			user = sk;
-			nuser++;
+	for (i = slot; i < ARRAY_SIZE(net->ipv4.udp_tunnel_gro); i++) {
+		hlist_for_each_entry(up, &net->ipv4.udp_tunnel_gro[i].list,
+				     tunnel_list) {
+			sk = (struct sock *)up;
+			if (!udp_tunnel_gro_slot_match(sk, slot))
+				continue;
+
+			if (!sk->sk_kern_sock)
+				tier = 2;
+			else
+				tier = sk->sk_family != family;
+			pick[tier] = sk;
+			n[tier]++;
 		}
 	}
 
-	if (nkern)
-		return nkern == 1 ? kern : NULL;
+	for (tier = 0; tier < ARRAY_SIZE(n); tier++)
+		if (n[tier])
+			return n[tier] == 1 ? pick[tier] : NULL;
 
-	return nuser == 1 ? user : NULL;
+	return NULL;
 }
 
-static void udp_tunnel_gro_update_sk(struct udp_tunnel_gro *udp_tunnel_gro)
+static void udp_tunnel_gro_update_sk(struct net *net)
 {
-	rcu_assign_pointer(udp_tunnel_gro->sk,
-			   udp_tunnel_gro_pick(udp_tunnel_gro));
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(net->ipv4.udp_tunnel_gro); i++)
+		rcu_assign_pointer(net->ipv4.udp_tunnel_gro[i].sk,
+				   udp_tunnel_gro_pick(net, i));
 }
 
 void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add)
@@ -98,19 +129,10 @@ void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add)
 	else if (up->tunnel_list.pprev)
 		hlist_del_init_rcu(&up->tunnel_list);
 
-	udp_tunnel_gro_update_sk(udp_tunnel_gro);
+	udp_tunnel_gro_update_sk(net);
 	spin_unlock(&udp_tunnel_gro_lock);
 }
 EXPORT_SYMBOL_GPL(udp_tunnel_update_gro_lookup);
-
-/* Can @sk match the packets looked up in @slot (0: IPv4, 1: IPv6)? */
-static bool udp_tunnel_gro_slot_match(const struct sock *sk, int slot)
-{
-	if (slot)
-		return sk->sk_family == AF_INET6;
-
-	return sk->sk_family == AF_INET || !ipv6_only_sock(sk);
-}
 
 /* Add @sk to the fast path if no other socket can match its port. Under the
  * port hash slot lock, so that a concurrent bind() sees it, see
@@ -137,13 +159,13 @@ void udp_tunnel_gro_lookup_add(struct sock *sk)
 	sk_for_each(sk2, &hslot->head)
 		if (sk2 != sk && net_eq(sock_net(sk2), net) &&
 		    udp_sk(sk2)->udp_port_hash == sk->sk_num &&
-		    udp_tunnel_gro_slot_match(sk2, slot))
+		    udp_tunnel_gro_family_overlap(sk, sk2))
 			goto out;
 
 	spin_lock(&udp_tunnel_gro_lock);
 	udp_tunnel_gro = &net->ipv4.udp_tunnel_gro[slot];
 	hlist_add_head_rcu(&udp_sk(sk)->tunnel_list, &udp_tunnel_gro->list);
-	udp_tunnel_gro_update_sk(udp_tunnel_gro);
+	udp_tunnel_gro_update_sk(net);
 	spin_unlock(&udp_tunnel_gro_lock);
 out:
 	spin_unlock_bh(&hslot->lock);
@@ -159,33 +181,34 @@ void udp_tunnel_gro_lookup_bind(struct sock *sk, unsigned short port)
 	struct udp_tunnel_gro *udp_tunnel_gro;
 	struct net *net = sock_net(sk);
 	struct hlist_node *tmp;
+	bool found = false;
 	struct udp_sock *up;
-	bool found;
 	int i;
 
+	/* sockets on @port are only added under the lock we hold */
+	rcu_read_lock();
+	for (i = 0; i < ARRAY_SIZE(net->ipv4.udp_tunnel_gro); i++)
+		hlist_for_each_entry_rcu(up, &net->ipv4.udp_tunnel_gro[i].list,
+					 tunnel_list)
+			found |= up->inet.inet_num == port &&
+				 udp_tunnel_gro_family_overlap(sk,
+							       (struct sock *)up);
+	rcu_read_unlock();
+	if (!found)
+		return;
+
+	spin_lock(&udp_tunnel_gro_lock);
 	for (i = 0; i < ARRAY_SIZE(net->ipv4.udp_tunnel_gro); i++) {
 		udp_tunnel_gro = &net->ipv4.udp_tunnel_gro[i];
-		if (!udp_tunnel_gro_slot_match(sk, i))
-			continue;
-
-		/* sockets on @port are only added under the lock we hold */
-		found = false;
-		rcu_read_lock();
-		hlist_for_each_entry_rcu(up, &udp_tunnel_gro->list, tunnel_list)
-			found |= up->inet.inet_num == port;
-		rcu_read_unlock();
-		if (!found)
-			continue;
-
-		spin_lock(&udp_tunnel_gro_lock);
 		hlist_for_each_entry_safe(up, tmp, &udp_tunnel_gro->list,
 					  tunnel_list)
-			if (up->inet.inet_num == port)
+			if (up->inet.inet_num == port &&
+			    udp_tunnel_gro_family_overlap(sk, (struct sock *)up))
 				hlist_del_init_rcu(&up->tunnel_list);
-
-		udp_tunnel_gro_update_sk(udp_tunnel_gro);
-		spin_unlock(&udp_tunnel_gro_lock);
 	}
+
+	udp_tunnel_gro_update_sk(net);
+	spin_unlock(&udp_tunnel_gro_lock);
 }
 
 void udp_tunnel_update_gro_rcv(struct sock *sk, bool add)
